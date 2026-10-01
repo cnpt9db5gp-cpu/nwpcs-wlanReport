@@ -5,7 +5,9 @@ Linux equivalent of `netsh wlan show networks` + `netsh wlanreport`.
 Scan nearby Wi-Fi networks and generate a single-file HTML report you can
 open in any browser (`file://` — no server needed), or serve over HTTP.
 Ships with an ASCII-art banner, chat-style progress log, and an interactive
-chatbox mode.
+chatbox mode. On a terminal it plays a short animated signal intro and shows
+spinners during long steps — automatically disabled when piped, and manually
+with `--no-animate` (plus `--no-banner` / `--no-color` for calm output).
 
 ## Requirements
 
