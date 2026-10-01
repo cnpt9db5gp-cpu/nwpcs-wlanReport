@@ -84,7 +84,6 @@ Commands: `check | scan | info | advise | speed | history | report [-o file] | o
 The transcript is saved inside the data dir (see below).
 
 ### Bigger diagnostics
-
 - **History** — every `scan`/`info`/`report` appends to `history.db` in the
   data dir (30-day retention, `--no-history` opts out). The report charts
   per-SSID signal over 7 days plus recent link snapshots.
@@ -95,6 +94,24 @@ The transcript is saved inside the data dir (see below).
   (skip with `--no-speed`), on demand via `nwpcs-wlandiag speed [--bytes N]`.
 - **Security audit** — flags open/WEP/WPA1-TKIP networks and mixed-security
   same-SSID groups (evil-twin suspects), plus a verdict on your own link.
+
+### Fix-it kit (works offline)
+
+Every repair ships inside the tool — nothing to download when you're already
+offline:
+
+```bash
+nwpcs-wlandiag fix              # diagnose → propose plan → confirm → repair → verify
+nwpcs-wlandiag fix --dry-run    # preview only, change nothing
+nwpcs-wlandiag fix --list       # show all 8 repair steps and their commands
+nwpcs-wlandiag fix --only dns-flush,dns-switch
+nwpcs-wlandiag fix --undo-dns   # revert a previous DNS switch
+```
+
+Steps cover radio/rfkill, rescan, reconnect, DHCP renew, DNS flush + switch to
+`1.1.1.1,8.8.8.8` (revertible), and last-resort NetworkManager restart
+(`--full`). Disruptive steps ask first; `--yes` skips asking. The HTML report
+also embeds a Repair-kit card with the same commands for copy-paste.
 
 ### Where files go
 

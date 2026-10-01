@@ -341,6 +341,293 @@ def audit_security(nets, cur_bssid=""):
     order = {"crit": 0, "high": 1, "info": 2, "good": 3}
     return sorted(findings, key=lambda f: order.get(f[0], 4))
 
+
+# ------------------------------------------------- offline fix-it kit
+
+# Every repair lives here as code AND as copy-paste commands (see
+# repair_kit_html / `fix --list`), so fixes stay available with no internet.
+# Steps are standard, reversible NetworkManager operations. Disruptive ones
+# (reconnect, restart) ask first unless --yes is given.
+
+def _needs_root():
+    try:
+        return os.geteuid() != 0
+    except AttributeError:
+        return True
+
+
+def _sudo(cmd):
+    if _needs_root() and shutil.which("sudo"):
+        return ["sudo"] + cmd
+    return cmd
+
+
+def _confirm(prompt):
+    try:
+        if not sys.stdin.isatty():
+            return False
+        ans = input(prompt + " [y/N] ").strip().lower()
+        return ans in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def _iw_connected(iface):
+    out, _ = run(["iw", "dev", iface, "link"], timeout=10)
+    return "Connected to" in out
+
+
+def _active_conn(iface):
+    out, _ = run(["nmcli", "-t", "-f", "GENERAL.CONNECTION", "device", "show", iface], timeout=10)
+    m = re.search(r"GENERAL\.CONNECTION:\s*(.+)", out)
+    name = m.group(1).strip() if m else ""
+    return "" if name in ("", "--") else name
+
+
+def fix_radio(iface, log=None):
+    out, _ = run(["nmcli", "radio", "wifi"], timeout=10)
+    if out.strip() == "enabled":
+        return "ok", "Wi-Fi radio already on"
+    out2, code = run(["nmcli", "radio", "wifi", "on"], timeout=10)
+    return ("fixed", "Wi-Fi radio turned on") if code == 0 else ("failed", out2[-200:])
+
+
+def fix_rfkill(iface, log=None):
+    if shutil.which("rfkill") is None:
+        return "skipped", "rfkill not installed — unlikely to be blocked"
+    out, _ = run(["rfkill", "list", "wifi"], timeout=10)
+    blocked = bool(re.search(r"soft blocked:\s*yes|hard blocked:\s*yes", out, re.I))
+    if not blocked and out and "missing" not in out:
+        return "ok", "no RF kill switches active"
+    out2, code = run(_sudo(["rfkill", "unblock", "wifi"]), timeout=10)
+    return ("fixed", "RF kill cleared") if code == 0 else ("failed", out2[-200:])
+
+
+def fix_rescan(iface, log=None):
+    _, code = run(["nmcli", "device", "wifi", "rescan", "ifname", iface], timeout=15)
+    time.sleep(2)
+    return ("ok", "fresh scan requested") if code == 0 else ("failed", "rescan rejected by NetworkManager")
+
+
+def fix_reconnect(iface, log=None):
+    name = _active_conn(iface)
+    if not name:
+        out, _ = run(["nmcli", "-t", "-f", "NAME,TYPE,TIMESTAMP", "connection", "show"], timeout=10)
+        cands = [l.split(":")[0] for l in out.splitlines()
+                 if ":802-11-wireless:" in l and l.split(":")[0]]
+        if not cands:
+            return "failed", "no saved Wi-Fi profiles to join"
+        name = cands[0]
+    run(["nmcli", "connection", "down", name], timeout=15)
+    time.sleep(1)
+    out, code = run(["nmcli", "connection", "up", name], timeout=30)
+    if code != 0:
+        return "failed", out[-200:]
+    for _ in range(15):
+        if _iw_connected(iface):
+            return "fixed", f"reconnected to '{name}'"
+        time.sleep(1)
+    return "failed", f"'{name}' did not associate within 15s"
+
+
+def fix_dhcp(iface, log=None):
+    out, code = run(["nmcli", "device", "reapply", iface], timeout=20)
+    if code != 0:
+        name = _active_conn(iface)
+        if name:
+            run(["nmcli", "connection", "down", name], timeout=15)
+            time.sleep(1)
+            out, code = run(["nmcli", "connection", "up", name], timeout=30)
+    if code != 0:
+        return "failed", out[-200:] if out else "DHCP renew rejected"
+    time.sleep(2)
+    ip4, _ = run(["nmcli", "-t", "-f", "IP4.ADDRESS", "device", "show", iface], timeout=10)
+    if "169.254." in ip4 or "ADDRESS" not in ip4:
+        return "failed", "still no valid lease (APIPA or empty)"
+    return "fixed", "DHCP lease renewed"
+
+
+def fix_dns_flush(iface, log=None):
+    for cmd in (["resolvectl", "flush-caches"], ["systemd-resolve", "--flush-caches"]):
+        if shutil.which(cmd[0]) is None:
+            continue
+        _, code = run(cmd, timeout=10)
+        if code == 0:
+            return "fixed", "DNS cache flushed"
+    return "skipped", "no DNS flush tool found"
+
+
+def _dns_backup_path():
+    return data_dir() / "dns-backup.json"
+
+
+def fix_dns_switch(iface, log=None):
+    name = _active_conn(iface)
+    if not name:
+        return "failed", "no active connection to modify (connect first)"
+    cur, _ = run(["nmcli", "-t", "-f", "ipv4.dns,ipv4.ignore-auto-dns",
+                  "connection", "show", name], timeout=10)
+    try:
+        data_dir().mkdir(parents=True, exist_ok=True)
+        _dns_backup_path().write_text(json.dumps({"connection": name, "was": cur}), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    cmds = [["nmcli", "connection", "modify", name, "ipv4.dns", "1.1.1.1,8.8.8.8",
+             "ipv4.ignore-auto-dns", "yes"],
+            ["nmcli", "connection", "up", name]]
+    last = ""
+    for c in cmds:
+        last, code = run(c, timeout=20)
+        if code != 0 and "not authorized" in last.lower() and shutil.which("sudo"):
+            last, code = run(["sudo"] + c, timeout=20)
+        if code != 0:
+            return "failed", last[-200:]
+    time.sleep(2)
+    probe, _ = run(["getent", "hosts", "google.com"], timeout=10)
+    if probe.strip():
+        return "fixed", "DNS now via 1.1.1.1,8.8.8.8 (previous saved — `fix --undo-dns` reverts)"
+    return "failed", "DNS still not resolving after switch"
+
+
+def fix_dns_undo(iface, log=None):
+    try:
+        bak = json.loads(_dns_backup_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return "failed", "no DNS backup found — nothing to revert"
+    return ("fixed", f"revert with: nmcli connection modify '{bak['connection']}' "
+                     f"ipv4.dns \"\" ipv4.ignore-auto-dns no && nmcli connection up '{bak['connection']}'")
+
+
+def fix_nm_restart(iface, log=None):
+    if shutil.which("systemctl") is None:
+        return "skipped", "no systemctl here"
+    _, code = run(_sudo(["systemctl", "restart", "NetworkManager"]), timeout=30)
+    if code != 0:
+        return "failed", "restart rejected (need sudo?)"
+    for _ in range(30):
+        time.sleep(1)
+        out, code = run(["nmcli", "general", "status"], timeout=10)
+        if code == 0:
+            if _iw_connected(iface):
+                return "fixed", "NetworkManager restarted, link re-associated"
+            return "ok", "NetworkManager restarted (reconnect manually if needed)"
+    return "failed", "NetworkManager did not come back within 30s"
+
+
+FIX_STEPS = [
+    {"id": "radio", "title": "Turn Wi-Fi radio on", "root": False,
+     "cmds": ["nmcli radio wifi on"], "fn": fix_radio},
+    {"id": "rfkill", "title": "Clear RF kill switches", "root": False,
+     "cmds": ["rfkill unblock wifi"], "fn": fix_rfkill},
+    {"id": "rescan", "title": "Force a fresh network scan", "root": False,
+     "cmds": ["nmcli device wifi rescan"], "fn": fix_rescan},
+    {"id": "reconnect", "title": "Reconnect (brief drop)", "root": False, "confirm": True,
+     "cmds": ["nmcli connection down <name>", "nmcli connection up <name>"], "fn": fix_reconnect},
+    {"id": "dhcp", "title": "Renew DHCP lease", "root": False,
+     "cmds": ["nmcli device reapply <iface>"], "fn": fix_dhcp},
+    {"id": "dns-flush", "title": "Flush DNS cache", "root": False,
+     "cmds": ["resolvectl flush-caches"], "fn": fix_dns_flush},
+    {"id": "dns-switch", "title": "Switch DNS to 1.1.1.1,8.8.8.8 (revertible)", "root": False,
+     "confirm": True,
+     "cmds": ["nmcli connection modify <name> ipv4.dns 1.1.1.1,8.8.8.8 ipv4.ignore-auto-dns yes",
+              "nmcli connection up <name>"], "fn": fix_dns_switch},
+    {"id": "nm-restart", "title": "Restart NetworkManager (drops all links ~10s)", "root": True,
+     "confirm": True,
+     "cmds": ["sudo systemctl restart NetworkManager"], "fn": fix_nm_restart},
+]
+
+
+def diagnose_for_fix(iface, log=None):
+    """Fast offline-capable diagnosis. Returns (problems, suggested step ids, notes)."""
+    problems, plan, notes = [], [], []
+    out, _ = run(["nmcli", "radio", "wifi"], timeout=10)
+    if out.strip() != "enabled":
+        problems.append("Wi-Fi radio is off")
+        plan.append("radio")
+    if shutil.which("rfkill"):
+        rk, _ = run(["rfkill", "list", "wifi"], timeout=10)
+        if re.search(r"soft blocked:\s*yes|hard blocked:\s*yes", rk, re.I):
+            problems.append("RF kill switch is blocking Wi-Fi")
+            plan.append("rfkill")
+    if not _iw_connected(iface):
+        problems.append("not associated to any access point")
+        plan += ["rescan", "reconnect"]
+    else:
+        ip4, _ = run(["nmcli", "-t", "-f", "IP4.ADDRESS", "device", "show", iface], timeout=10)
+        if "169.254." in ip4 or "ADDRESS" not in ip4:
+            problems.append("no valid DHCP lease")
+            plan.append("dhcp")
+        else:
+            gw, _ = run(["nmcli", "-t", "-f", "IP4.GATEWAY", "device", "show", iface], timeout=10)
+            gw = gw.split(":")[-1].strip() if ":" in gw else "192.168.1.1"
+            gp, _ = run(["ping", "-c", "2", "-W", "2", gw], timeout=10)
+            if "0 received" in gp or "100% packet loss" in gp:
+                problems.append(f"gateway {gw} unreachable")
+                plan.append("reconnect")
+                notes.append("If the gateway stays unreachable: reboot your router "
+                             "(unplug 10s), check its cables, then re-run.")
+            else:
+                ext, _ = run(["ping", "-c", "2", "-W", "2", "8.8.8.8"], timeout=10)
+                dns, _ = run(["getent", "hosts", "google.com"], timeout=10)
+                if ("0 received" in ext or "100% packet loss" in ext) and not dns.strip():
+                    problems.append("internet unreachable beyond the router")
+                    notes.append("Router is fine but upstream is down — likely your ISP. "
+                                 "Check the router's WAN light, then call them with these symptoms.")
+                elif not dns.strip():
+                    problems.append("DNS not resolving (internet itself works)")
+                    plan += ["dns-flush", "dns-switch"]
+    if not problems:
+        notes.append("Link looks healthy — if pages still fail, try `speed` to check throughput, "
+                     "or look for congestion in the channel advisor.")
+    seen, ordered = set(), []
+    for step_id in plan:
+        if step_id not in seen:
+            seen.add(step_id)
+            ordered.append(step_id)
+    return problems, ordered, notes
+
+
+def run_fix_plan(iface, step_ids, dry_run=False, auto_yes=False, log=None):
+    results = []
+    for st in FIX_STEPS:
+        if st["id"] not in step_ids:
+            continue
+        if dry_run:
+            results.append((st["id"], "dry-run", "would run: " + " && ".join(st["cmds"])))
+            continue
+        if st.get("confirm") and not auto_yes and not _confirm(f"Apply '{st['title']}'?"):
+            results.append((st["id"], "skipped", "declined"))
+            if log:
+                log.say("sys", f"skipped '{st['id']}' (declined)")
+            continue
+        try:
+            status, detail = st["fn"](iface, log)
+        except Exception as e:  # noqa: BLE001
+            status, detail = "failed", f"{type(e).__name__}: {e}"
+        results.append((st["id"], status, detail))
+        if log:
+            mark = {"fixed": "ok", "ok": "ok", "failed": "err", "skipped": "sys"}.get(status, "sys")
+            log.say(mark, f"[{st['id']}] {status}: {detail}")
+    return results
+
+
+def verify_link_quick(iface):
+    """One-line verdict after fixes: (ok: bool, summary: str)."""
+    if not _iw_connected(iface):
+        return False, "still not associated to any AP"
+    gw_out, _ = run(["nmcli", "-t", "-f", "IP4.GATEWAY", "device", "show", iface], timeout=10)
+    gw = gw_out.split(":")[-1].strip() if ":" in gw_out else ""
+    if not gw or gw == "--":
+        return False, "associated but no gateway"
+    gp, _ = run(["ping", "-c", "2", "-W", "2", gw], timeout=10)
+    if "0 received" in gp or "100% packet loss" in gp:
+        return False, f"associated but gateway {gw} unreachable"
+    dns, _ = run(["getent", "hosts", "google.com"], timeout=10)
+    if not dns.strip():
+        return False, "gateway OK but DNS not resolving"
+    return True, f"link works (gw {gw}, DNS resolving)"
+
 # ------------------------------------------------- ASCII art + chat UX
 
 BANNER = r"""
@@ -1093,6 +1380,32 @@ def render_html(data, log_minutes=60):
     else:
         speed_html = "<p class='muted'>Throughput test skipped (--no-speed).</p>"
 
+    def _failed(p):
+        return p.get("loss") not in ("0%", "?")
+    conn_name = dev_kv.get("GENERAL.CONNECTION", "") or "<profile>"
+    hot = set()
+    if _failed(pg):
+        hot.update(("reconnect", "dhcp", "router"))
+    if not _failed(pg) and _failed(pd):
+        hot.update(("dns-flush", "dns-switch"))
+    kit_rows = [
+        ("radio", "Wi-Fi radio off / blocked", "nmcli radio wifi on && rfkill unblock wifi"),
+        ("rescan", "AP missing from scan", f"nmcli device wifi list ifname {iface} --rescan yes"),
+        ("reconnect", "Not associated / gateway down",
+         f'nmcli connection down "{conn_name}" && nmcli connection up "{conn_name}"'),
+        ("dhcp", "No valid lease (169.254.x.x)", f"nmcli device reapply {iface}"),
+        ("dns-flush", "Stale DNS cache", "resolvectl flush-caches"),
+        ("dns-switch", "DNS not resolving",
+         f'nmcli connection modify "{conn_name}" ipv4.dns "1.1.1.1,8.8.8.8" '
+         f'ipv4.ignore-auto-dns yes && nmcli connection up "{conn_name}"'),
+        ("nm-restart", "Last resort (drops links ~10s)", "sudo systemctl restart NetworkManager"),
+        ("router", "Gateway dead after reconnects", "unplug router 10 s → plug back → wait 2 min → re-scan"),
+    ]
+    kit_html = "".join(
+        f"<tr><td>{'● ' if kid in hot else ''}{esc(when)}</td>"
+        f"<td class='mono'>{esc(cmd)}</td></tr>"
+        for kid, when, cmd in kit_rows)
+
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1181,6 +1494,9 @@ footer{{color:#888;font-size:12px;text-align:center;margin:14px}}
 <h3>Recent link snapshots</h3><table><tr><th>Time</th><th>SSID</th><th>Signal</th><th>GW ping</th><th>Inet ping</th></tr>{link_rows_html}</table></div>
 <div class="card"><h2>Channel advisor</h2>{advisor_html}<p class="muted">Scores weigh nearby APs by signal strength — 2.4 GHz accounts for channel overlap, 5 GHz for co-channel sharing. Apply the pick on your router, then re-scan.</p></div>
 <div class="card"><h2>Security audit</h2><ul class="recs">{audit_html}</ul></div>
+<div class="card"><h2>Repair kit (works offline)</h2>
+<p class="muted">Every fix below ships inside the tool — run <code>nwpcs-wlandiag fix</code> to apply them guided (diagnose → confirm → repair → verify), or copy-paste manually with no internet. ● marks rows matching this run's symptoms.</p>
+<table><tr><th>When</th><th>Fix</th></tr>{kit_html}</table></div>
 <div class="card"><h2>Throughput</h2>{speed_html}</div>
 <div class="card"><h2>Connectivity diagnostics</h2>
 <table><tr><th>Target</th><th>Loss</th><th>min</th><th>avg</th><th>max</th><th>mdev</th></tr>
@@ -1382,6 +1698,17 @@ def build_parser():
     o.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
     o.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
 
+    f = sub.add_parser("fix", help="diagnose and repair the connection (guided, offline)")
+    f.add_argument("--iface", default=argparse.SUPPRESS)
+    f.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
+    f.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
+    f.add_argument("--list", action="store_true", help="list available repair steps without running")
+    f.add_argument("--only", default=None, help="comma-separated step ids to run (see --list)")
+    f.add_argument("--full", action="store_true", help="include last-resort NetworkManager restart in auto plan")
+    f.add_argument("--dry-run", action="store_true", help="show what would run, change nothing")
+    f.add_argument("--yes", action="store_true", help="apply without asking (dangerous steps still listed)")
+    f.add_argument("--undo-dns", action="store_true", help="revert a previous DNS switch")
+
     h = sub.add_parser("history", help="show recorded signal/link history")
     h.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
     h.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
@@ -1417,7 +1744,7 @@ def cmd_chat(iface, use_color=True, banner=True):
     if banner:
         show_banner(use_color=use_color)
     chat.box("nwpcs-wlandiag chat",
-             "commands: check | scan | info | advise | speed | history | report [-o file] | open | serve [port] | log | clear | help | exit")
+             "commands: check | scan | info | advise | speed | history | fix | report [-o file] | open | serve [port] | log | clear | help | exit")
     chat.say("wlan", f"hey! watching {iface} for you. what should we diagnose?")
     last_report = DEFAULT_OUT
     HELP = ("check ......... verify tools + permissions (check-deps)\n"
@@ -1426,6 +1753,7 @@ def cmd_chat(iface, use_color=True, banner=True):
             "advise ........ best Wi-Fi channels for your router\n"
             "speed ......... measure real download throughput\n"
             "history ....... show recorded signal/link history\n"
+            "fix ........... diagnose + repair (fix --dry-run to preview)\n"
             "report ........ generate HTML report (report -o /tmp/x.html)\n"
             "open .......... open report in browser (builds one if missing)\n"
             "serve [port] .. serve last report over HTTP\n"
@@ -1503,6 +1831,41 @@ def cmd_chat(iface, use_color=True, banner=True):
                     chat.say("wlan", f"{ts} · {r['ssid'] or '-'} · "
                                      f"{r['dbm']} dBm · gw {r['ping_gw']} ms · inet {r['ping_ext']} ms")
                 chat.say("wlan", "full charts live in your next HTML report.")
+        elif cmd == "fix":
+            if "--list" in rest:
+                for st in FIX_STEPS:
+                    print(f"  {st['id']:12} {st['title']}")
+                chat.say("wlan", "run `fix --only a,b` — or just `fix` and I'll pick.")
+            elif "--undo-dns" in rest:
+                status, detail = fix_dns_undo(iface, chat)
+                chat.say("wlan", f"{status}: {detail}")
+            else:
+                only = None
+                if "--only" in rest:
+                    i = rest.index("--only")
+                    only = [s.strip() for s in rest[i + 1].split(",")] if i + 1 < len(rest) else []
+                dry = "--dry-run" in rest
+                if only:
+                    plan, problems, notes = only, ["manual selection"], []
+                else:
+                    chat.say("wlan", "quick diagnosis first…")
+                    problems, plan, notes = diagnose_for_fix(iface, log=chat)
+                    if "--full" in rest and "nm-restart" not in plan:
+                        plan.append("nm-restart")
+                if not plan:
+                    chat.say("wlan", "link looks healthy — nothing to fix." if not problems
+                             else "No automatic fix for: " + "; ".join(problems))
+                else:
+                    chat.say("wlan", "plan: " + " → ".join(plan))
+                    for n in notes:
+                        chat.say("wlan", "note: " + n)
+                    if dry or "--yes" in rest or _confirm("Run this repair plan?"):
+                        run_fix_plan(iface, plan, dry_run=dry, auto_yes=True, log=chat)
+                        if not dry:
+                            ok, verdict = verify_link_quick(iface)
+                            chat.say("wlan", ("fixed! " if ok else "still broken: ") + verdict)
+                    else:
+                        chat.say("wlan", "aborted — nothing changed.")
         elif cmd == "report":
             out = DEFAULT_OUT
             if rest:
@@ -1544,7 +1907,7 @@ def main(argv=None):
     # legacy: `nwpcs-wlandiag out.html` (no subcommand) == `nwpcs-wlandiag report -o out.html`
     if argv is None:
         argv = sys.argv[1:]
-    if argv and argv[0] not in ("scan", "info", "chat", "check-deps", "doctor", "report", "serve", "open", "history", "speed", "-h", "--help", "-V", "--version") and not argv[0].startswith("-"):
+    if argv and argv[0] not in ("scan", "info", "chat", "check-deps", "doctor", "report", "serve", "open", "history", "speed", "fix", "-h", "--help", "-V", "--version") and not argv[0].startswith("-"):
         argv = ["report", "-o"] + argv
     args = build_parser().parse_args(argv)
     cmd = args.cmd or "chat"  # bare `nwpcs-wlandiag` drops into interactive mode
@@ -1643,6 +2006,62 @@ def main(argv=None):
             print(f"Speed test failed: {res['error']}")
             sys.exit(1)
         return
+
+    if cmd == "fix":
+        if getattr(args, "list", False):
+            print(f"{'STEP':12} {'ROOT':5} TITLE / COMMANDS")
+            print("-" * 70)
+            for st in FIX_STEPS:
+                print(f"{st['id']:12} {'yes' if st.get('root') else 'no':5} {st['title']}")
+                for c in st["cmds"]:
+                    print(f"{'':12} {'':5} $ {c}")
+            return
+        if getattr(args, "undo_dns", False):
+            status, detail = fix_dns_undo(iface, chat)
+            print(f"{status}: {detail}")
+            sys.exit(0 if status == "fixed" else 1)
+        only = getattr(args, "only", None)
+        if only:
+            ids = [s.strip() for s in only.split(",") if s.strip()]
+            known = {st["id"] for st in FIX_STEPS}
+            bad = [s for s in ids if s not in known]
+            if bad:
+                print(f"error: unknown step(s): {', '.join(bad)} (see `fix --list`)", file=sys.stderr)
+                sys.exit(2)
+            plan, problems, notes = ids, ["manual step selection"], []
+        else:
+            chat.say("wlan", "quick diagnosis first…")
+            problems, plan, notes = diagnose_for_fix(iface, log=chat)
+            if getattr(args, "full", False) and "nm-restart" not in plan:
+                plan.append("nm-restart")
+        if not plan:
+            print("Link looks healthy — nothing to fix." if not problems
+                  else "No automatic fix for: " + "; ".join(problems))
+            for n in notes:
+                print("note: " + n)
+            return
+        print("Problems: " + "; ".join(problems))
+        print("Plan: " + " → ".join(plan))
+        for n in notes:
+            print("note: " + n)
+        dry = bool(getattr(args, "dry_run", False))
+        if not dry and not getattr(args, "yes", False) and not _confirm("Run this repair plan?"):
+            print("aborted — nothing changed.")
+            return
+        results = run_fix_plan(iface, plan, dry_run=dry,
+                               auto_yes=bool(getattr(args, "yes", False)), log=chat)
+        print(f"\n{'STEP':12} {'STATUS':8} DETAIL")
+        print("-" * 70)
+        failed = 0
+        for sid, status, detail in results:
+            print(f"{sid:12} {status:8} {detail}")
+            if status == "failed":
+                failed += 1
+        if dry:
+            return
+        ok, verdict = verify_link_quick(iface)
+        print(("\nOK: " if ok else "\nStill broken: ") + verdict)
+        sys.exit(0 if ok and not failed else 1)
 
     if cmd == "serve":
         serve_file(args.file, bind=args.bind, port=args.port, open_browser=args.open)
