@@ -57,7 +57,9 @@ nwpcs-wlandiag check-deps                     # verify tools + permissions first
 nwpcs-wlandiag check-deps --json              # machine-readable readiness
 nwpcs-wlandiag scan                          # terminal table (like netsh wlan show networks)
 nwpcs-wlandiag scan --json --limit 10 --sort signal|channel|ssid
-nwpcs-wlandiag info                          # current connection summary
+nwpcs-wlandiag info                          # current connection + best channels + security summary
+nwpcs-wlandiag speed                          # real download throughput in Mbps
+nwpcs-wlandiag history                        # signal/link snapshots over time
 nwpcs-wlandiag chat                          # interactive chatbox mode
 nwpcs-wlandiag report                        # -> data dir (see below) + -data.json + -chat.log
 nwpcs-wlandiag report -o /tmp/wifi.html --open
@@ -78,8 +80,21 @@ you> open
 you> exit
 ```
 
-Commands: `check | scan | info | report [-o file] | open | serve [port] | log | clear | help | exit`.
+Commands: `check | scan | info | advise | speed | history | report [-o file] | open | serve [port] | log | clear | help | exit`.
 The transcript is saved inside the data dir (see below).
+
+### Bigger diagnostics
+
+- **History** — every `scan`/`info`/`report` appends to `history.db` in the
+  data dir (30-day retention, `--no-history` opts out). The report charts
+  per-SSID signal over 7 days plus recent link snapshots.
+- **Channel advisor** — scores channels by neighbor congestion (with 2.4 GHz
+  overlap math) and names the best pick per band, in `info`, chat (`advise`),
+  and the report.
+- **Speed test** — real HTTP download throughput in Mbps. Runs in `report`
+  (skip with `--no-speed`), on demand via `nwpcs-wlandiag speed [--bytes N]`.
+- **Security audit** — flags open/WEP/WPA1-TKIP networks and mixed-security
+  same-SSID groups (evil-twin suspects), plus a verdict on your own link.
 
 ### Where files go
 
@@ -90,7 +105,8 @@ organized directory (XDG-aware — honors `$XDG_DATA_HOME`):
 ~/.local/share/nwpcs-wlandiag/
 ├── nwpcs-wlandiag.html       # latest report (open with `nwpcs-wlandiag open`)
 ├── nwpcs-wlandiag-data.json  # raw scan data
-└── nwpcs-wlandiag-chat.log   # chat transcripts
+├── nwpcs-wlandiag-chat.log   # chat transcripts
+└── history.db                # signal/link history (sqlite)
 ```
 
 Pass `-o` anywhere else if you want a report in a specific place — sidecars
