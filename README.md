@@ -47,6 +47,7 @@ wlan-report info                          # current connection summary
 wlan-report chat                          # interactive chatbox mode
 wlan-report report                        # -> ~/wlan-report.html + -data.json + -chat.log
 wlan-report report -o /tmp/wifi.html --open
+wlan-report open                            # open ~/wlan-report.html in your browser
 wlan-report report --serve --port 8000    # generate + serve + open browser
 wlan-report serve ~/wlan-report.html --port 8000 --open
 wlan-report --iface wlo1 report -o out.html
