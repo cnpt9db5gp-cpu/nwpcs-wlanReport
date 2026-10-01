@@ -40,7 +40,7 @@ import threading
 import time
 import webbrowser
 
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 DEFAULT_OUT = str(pathlib.Path.home() / "wlan-report.html")
 
 # ------------------------------------------------- ASCII art + chat UX
@@ -733,27 +733,30 @@ def render_html(data, log_minutes=60):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Wi-Fi Diagnostic Report — {esc(hostname)}</title>
 <style>
-:root{{--bg:#0f172a;--card:#ffffff;--muted:#64748b;--line:#e2e8f0;--accent:#2563eb}}
-*{{box-sizing:border-box}}body{{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;background:#f1f5f9;color:#0f172a}}
-header{{background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;padding:28px 24px}}
-header h1{{margin:0 0 6px;font-size:24px}}header p{{margin:2px 0;opacity:.9}}
+:root{{--bg:#04060b;--card:#0b1120;--muted:#8ea0c2;--line:#1e2a45;--accent:#6d9bff;--text:#e8eefb}}
+*{{box-sizing:border-box}}body{{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;background:var(--bg);color:var(--text)}}
+header{{background:linear-gradient(135deg,#020409 0%,#0a1430 55%,#12224d 100%);color:#fff;padding:28px 24px;border-bottom:1px solid #22345c}}
+header h1{{margin:0 0 6px;font-size:24px;text-shadow:0 0 18px rgba(109,155,255,.45)}}header p{{margin:2px 0;opacity:.9}}
+header code{{color:#9dbcff}}
 .wrap{{max-width:1100px;margin:-18px auto 40px;padding:0 16px}}
-.card{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin:14px 0;box-shadow:0 2px 10px rgba(15,23,42,.05)}}
-.card h2{{margin:0 0 12px;font-size:18px;border-bottom:2px solid var(--line);padding-bottom:8px}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin:14px 0;box-shadow:0 4px 24px rgba(0,0,0,.55)}}
+.card h2{{margin:0 0 12px;font-size:18px;border-bottom:2px solid var(--line);padding-bottom:8px;color:#f2f6ff}}
+.card h3{{color:#dbe6ff}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}}
-.kpi{{background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:12px}}
-.kpi .v{{font-size:20px;font-weight:700}}.kpi .l{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}}
+.kpi{{background:#0e1628;border:1px solid var(--line);border-radius:10px;padding:12px}}
+.kpi .v{{font-size:20px;font-weight:700;color:#fff}}.kpi .l{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}}
 table{{width:100%;border-collapse:collapse;font-size:14px}}th,td{{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}}
-th{{background:#f8fafc;position:sticky;top:0}}tr.cur{{background:#eff6ff}}
+th{{background:#0e1628;position:sticky;top:0;color:#cdd9f2}}tr.cur{{background:#122441}}
 .muted{{color:var(--muted);font-size:12px}}.mono{{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}}
-.sig{{height:8px;background:#e2e8f0;border-radius:99px;overflow:hidden;min-width:110px}}.sigfill{{height:100%}}
-.hrow{{display:flex;align-items:center;gap:10px;margin:6px 0}}.hbar{{flex:1;height:12px;background:#e2e8f0;border-radius:99px;overflow:hidden}}.hfill{{height:100%;background:var(--accent)}}.sigfill2{{background:linear-gradient(90deg,#22c55e,#eab308,#ef4444)}}
+code{{color:#9dbcff}}
+.sig{{height:8px;background:#1a2540;border-radius:99px;overflow:hidden;min-width:110px}}.sigfill{{height:100%}}
+.hrow{{display:flex;align-items:center;gap:10px;margin:6px 0}}.hbar{{flex:1;height:12px;background:#1a2540;border-radius:99px;overflow:hidden}}.hfill{{height:100%;background:var(--accent);box-shadow:0 0 8px rgba(109,155,255,.6)}}.sigfill2{{background:linear-gradient(90deg,#22c55e,#eab308,#ef4444)}}
 .ch{{min-width:52px}}.ssid{{min-width:220px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-pre{{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:10px;overflow:auto;font-size:12px;max-height:380px}}
-.badge{{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;background:#e2e8f0;margin-right:6px}}
-li.good .badge{{background:#dcfce7;color:#166534}}li.warn .badge{{background:#fef9c3;color:#854d0e}}li.bad .badge{{background:#fee2e2;color:#991b1b}}li.info .badge{{background:#dbeafe;color:#1e40af}}
-ul.recs{{list-style:none;padding:0}}ul.recs li{{padding:10px;border:1px solid var(--line);border-radius:10px;margin:8px 0;background:#f8fafc}}
-.toolbar{{display:flex;gap:8px;margin-bottom:10px}}input[type=search]{{flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:8px}}
+pre{{background:#020409;color:#d7e3fa;padding:14px;border-radius:10px;overflow:auto;font-size:12px;max-height:380px;border:1px solid var(--line)}}
+.badge{{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;background:#1a2540;color:#9db1d8;margin-right:6px}}
+li.good .badge{{background:#052e1b;color:#4ade80}}li.warn .badge{{background:#3a2a04;color:#facc15}}li.bad .badge{{background:#3f0d0d;color:#f87171}}li.info .badge{{background:#0b2447;color:#7db4ff}}
+ul.recs{{list-style:none;padding:0}}ul.recs li{{padding:10px;border:1px solid var(--line);border-radius:10px;margin:8px 0;background:#0e1628}}
+.toolbar{{display:flex;gap:8px;margin-bottom:10px}}input[type=search]{{flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#0e1628;color:var(--text)}}
 footer{{color:var(--muted);font-size:12px;text-align:center;margin:20px}}
 @media print{{header{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}.wrap{{margin:0;max-width:none}}}}
 </style></head><body>
