@@ -8,6 +8,7 @@ Examples:
   wlan-report scan                          # terminal table of nearby networks
   wlan-report scan --json                   # machine-readable scan
   wlan-report info                          # current connection summary
+  wlan-report check-deps                     # verify tools + permissions first
   wlan-report chat                          # interactive chatbox mode
   wlan-report report                         # -> ~/wlan-report.html
   wlan-report report -o /tmp/wifi.html --open
@@ -37,7 +38,7 @@ import threading
 import time
 import webbrowser
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_OUT = str(pathlib.Path.home() / "wlan-report.html")
 
 # ------------------------------------------------- ASCII art + chat UX
@@ -174,6 +175,141 @@ class ChatLog:
         pathlib.Path(path).write_text(header + "\n".join(lines) + "\n", encoding="utf-8")
         return str(path)
 
+
+# ------------------------------------------------- deps + capabilities
+
+# (binary, purpose, packages per distro family, required?)
+DEPS = [
+    ("nmcli", "scan + adapter/IP state (NetworkManager)",
+     {"arch": "networkmanager", "debian": "network-manager", "fedora": "NetworkManager"}, True),
+    ("iw", "live link rate/signal (wireless tools)",
+     {"arch": "iw", "debian": "iw", "fedora": "iw"}, True),
+    ("ip", "routes (iproute2)",
+     {"arch": "iproute2", "debian": "iproute2", "fedora": "iproute"}, True),
+    ("ping", "latency probes (iputils)",
+     {"arch": "iputils", "debian": "iputils-ping", "fedora": "iputils"}, False),
+    ("journalctl", "NetworkManager event history (systemd)",
+     {"arch": "systemd", "debian": "systemd", "fedora": "systemd"}, False),
+    ("lspci", "adapter identification (pciutils)",
+     {"arch": "pciutils", "debian": "pciutils", "fedora": "pciutils"}, False),
+]
+
+
+def detect_distro():
+    try:
+        ids = {}
+        for line in pathlib.Path("/etc/os-release").read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                ids[k] = v.strip().strip('"').lower()
+        return ids.get("ID", ""), ids.get("ID_LIKE", "")
+    except Exception:  # noqa: BLE001
+        return "", ""
+
+
+def _pkg_for(distro, like, pkgs):
+    for fam in [distro] + like.split() + ["debian"]:
+        if fam == "arch":
+            return pkgs["arch"], "sudo pacman -S"
+        if fam in ("debian", "ubuntu", "linuxmint", "pop", "raspbian", "kali"):
+            return pkgs["debian"], "sudo apt install"
+        if fam in ("fedora", "rhel", "centos", "almalinux", "rocky", "opensuse"):
+            return pkgs["fedora"], "sudo dnf install"
+    return pkgs["debian"], "sudo apt install"
+
+
+def wireless_ifaces():
+    found = []
+    try:
+        for p in pathlib.Path("/sys/class/net").iterdir():
+            if (p / "wireless").exists():
+                found.append(p.name)
+    except Exception:  # noqa: BLE001
+        pass
+    return sorted(found)
+
+
+def check_capabilities(iface=None):
+    """Probe tools + permissions. Returns list of dicts: name/ok/level/detail/hint.
+
+    level is 'required' or 'optional'. ok is True/False.
+    """
+    checks = []
+    distro, like = detect_distro()
+    for binary, purpose, pkgs, required in DEPS:
+        if shutil.which(binary):
+            checks.append({"name": binary, "ok": True, "level": "required" if required else "optional",
+                           "detail": purpose, "hint": ""})
+        else:
+            pkg, mgr = _pkg_for(distro, like, pkgs)
+            flag = "" if required else " (optional — related report sections will be skipped)"
+            checks.append({"name": binary, "ok": False, "level": "required" if required else "optional",
+                           "detail": "MISSING — " + purpose,
+                           "hint": f"install: {mgr} {pkg}{flag}"})
+    if shutil.which("nmcli"):
+        _, code = run(["nmcli", "general", "status"], timeout=10)
+        if code == 0:
+            checks.append({"name": "NetworkManager", "ok": True, "level": "required",
+                           "detail": "service is running", "hint": ""})
+        else:
+            checks.append({"name": "NetworkManager", "ok": False, "level": "required",
+                           "detail": "nmcli cannot reach NetworkManager",
+                           "hint": "start it: sudo systemctl enable --now NetworkManager"})
+    wifis = wireless_ifaces()
+    if wifis:
+        checks.append({"name": "wifi-iface", "ok": True, "level": "required",
+                       "detail": "wireless interface(s): " + ", ".join(wifis), "hint": ""})
+    else:
+        checks.append({"name": "wifi-iface", "ok": False, "level": "required",
+                       "detail": "no wireless interface found",
+                       "hint": "no Wi-Fi hardware/driver? check: lspci -k | grep -i network"})
+    if shutil.which("journalctl"):
+        out, code = run(["journalctl", "-u", "NetworkManager", "--since", "5 min ago",
+                         "--no-pager", "-n", "1"], timeout=15)
+        low = out.lower()
+        if code == 0 and "access denied" not in low and "no journal" not in low:
+            checks.append({"name": "journal", "ok": True, "level": "optional",
+                           "detail": "can read NetworkManager history", "hint": ""})
+        else:
+            checks.append({"name": "journal", "ok": False, "level": "optional",
+                           "detail": "cannot read system journal — event-log section will note this",
+                           "hint": "fix: sudo usermod -aG systemd-journal $USER (then re-login), "
+                                   "or run with sudo"})
+    if iface and iface not in wifis:
+        checks.append({"name": "iface:" + iface, "ok": False, "level": "required",
+                       "detail": f"interface '{iface}' is not a wireless interface",
+                       "hint": f"available: {', '.join(wifis) if wifis else '(none)'} — omit --iface to auto-detect"})
+    return checks
+
+
+def print_check_report(checks, use_color=True):
+    def paint(color, text):
+        return (_ANSI.get(color, "") + text + _ANSI["reset"]) if use_color else text
+
+    print(f"{'CHECK':16} {'STATUS':9} DETAIL / FIX")
+    print("-" * 70)
+    failed_required = 0
+    for c in checks:
+        if c["ok"]:
+            status = paint("green", "OK     ")
+        elif c["level"] == "required":
+            status = paint("red", "MISSING")
+            failed_required += 1
+        else:
+            status = paint("yellow", "LIMITED")
+        print(f"{c['name']:16} {status} {c['detail']}")
+        if c["hint"]:
+            print(f"{'':16} {'':9} -> {paint('dim', c['hint']) if use_color else c['hint']}")
+    print("-" * 70)
+    if failed_required:
+        print(paint("red", f"{failed_required} required check(s) failed — fix them, then re-run."))
+    else:
+        print(paint("green", "ready — all required checks passed."))
+        limited = [c for c in checks if not c["ok"]]
+        if limited:
+            print(paint("yellow", "note: some optional checks are LIMITED; those report sections degrade gracefully."))
+    return 1 if failed_required else 0
+
 # ---------------------------------------------------------------- utils
 
 def run(cmd, timeout=25):
@@ -275,6 +411,10 @@ def sec_label(s):
 # ------------------------------------------------------------ collectors
 
 def get_wifi_networks(iface, rescan=True, log=None):
+    if shutil.which("nmcli") is None:
+        if log:
+            log.say("err", "nmcli not found — cannot scan. install NetworkManager, then re-run.")
+        return []
     if rescan:
         if log:
             log.step("rescan", f"rescanning nearby networks on {iface}")
@@ -369,6 +509,11 @@ def collect_all(iface, rescan=True, do_ping=True, log_minutes=60, log=None):
     iw_station, _ = run(["iw", "dev", iface, "station", "dump"])
     lspci, _ = run(["lspci", "-k"])
     proc_wireless, _ = run(["cat", "/proc/net/wireless"])
+    if log:
+        if iw_link.startswith("[missing:"):
+            log.say("warn", "iw not found — link rate/signal falls back to estimates (install package 'iw')")
+        elif "Not connected" in iw_link:
+            log.say("warn", f"{iface} is not associated to any AP — Wi-Fi may be disconnected")
     _done("adapter", "adapter + link state collected")
 
     _step("nets", "scanning nearby networks")
@@ -399,7 +544,16 @@ def collect_all(iface, rescan=True, do_ping=True, log_minutes=60, log=None):
     _step("logs", f"reading NetworkManager journal (last {log_minutes} min)")
     nm_logs, _ = run(["journalctl", "-u", "NetworkManager", "--since",
                        f"{log_minutes} min ago", "--no-pager", "-o", "short-iso"], timeout=20)
-    _done("logs", "event history collected")
+    low = nm_logs.lower()
+    if "access denied" in low or "no journal" in low or "permission denied" in low:
+        nm_logs = ("[unavailable] cannot read the system journal from this user — "
+                   "the event-log section is skipped.\n"
+                   "Fix: sudo usermod -aG systemd-journal $USER (then re-login), or re-run with sudo.")
+        if log:
+            log.say("warn", "journal unreadable (permissions) — event-log section will note this, continuing.")
+        _done("logs", "journal unavailable (permissions), skipped gracefully")
+    else:
+        _done("logs", "event history collected")
     return {
         "iface": iface, "general": general, "dev_status": dev_status,
         "dev_kv": dev_kv, "dev_show_txt": dev_show_txt,
@@ -771,31 +925,38 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("scan", help="list nearby Wi-Fi networks in the terminal (like `netsh wlan show networks`)")
-    s.add_argument("--iface", default=None)
-    s.add_argument("--no-banner", action="store_true")
-    s.add_argument("--no-color", action="store_true")
+    s.add_argument("--iface", default=argparse.SUPPRESS)
+    s.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
+    s.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
     s.add_argument("--no-rescan", action="store_true", help="skip fresh rescan, use cached results (faster)")
     s.add_argument("--json", action="store_true", help="output JSON instead of table")
     s.add_argument("--limit", type=int, default=0, help="show only top N networks")
     s.add_argument("--sort", choices=["signal", "channel", "ssid"], default="signal")
 
     i = sub.add_parser("info", help="show current connection summary in the terminal")
-    i.add_argument("--iface", default=None)
-    i.add_argument("--no-banner", action="store_true")
-    i.add_argument("--no-color", action="store_true")
+    i.add_argument("--iface", default=argparse.SUPPRESS)
+    i.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
+    i.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
     i.add_argument("--no-rescan", action="store_true")
     i.add_argument("--no-ping", action="store_true", help="skip ping tests (faster/offline)")
     i.add_argument("--json", action="store_true")
 
     c = sub.add_parser("chat", help="interactive chatbox mode: talk to the diagnostic assistant")
-    c.add_argument("--iface", default=None)
-    c.add_argument("--no-banner", action="store_true")
-    c.add_argument("--no-color", action="store_true")
+    c.add_argument("--iface", default=argparse.SUPPRESS)
+    c.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
+    c.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
+
+    d = sub.add_parser("check-deps", aliases=["doctor"],
+                       help="verify tools, permissions and Wi-Fi readiness before diagnosing")
+    d.add_argument("--iface", default=argparse.SUPPRESS)
+    d.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
+    d.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
+    d.add_argument("--json", action="store_true", help="output machine-readable JSON")
 
     r = sub.add_parser("report", help="generate the HTML report (like `netsh wlanreport`)")
-    r.add_argument("--iface", default=None)
-    r.add_argument("--no-banner", action="store_true")
-    r.add_argument("--no-color", action="store_true")
+    r.add_argument("--iface", default=argparse.SUPPRESS)
+    r.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
+    r.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
     r.add_argument("-o", "--output", default=DEFAULT_OUT, help=f"output HTML path (default: {DEFAULT_OUT})")
     r.add_argument("--json-out", default=None, help="also write raw JSON here (default: <output>-data.json)")
     r.add_argument("--no-json", action="store_true", help="don't write the sidecar JSON file")
@@ -823,10 +984,11 @@ def cmd_chat(iface, use_color=True, banner=True):
     if banner:
         show_banner(use_color=use_color)
     chat.box("wlan-report chat",
-             "commands: scan | info | report [-o file] | open | serve [port] | log | clear | help | exit")
+             "commands: check | scan | info | report [-o file] | open | serve [port] | log | clear | help | exit")
     chat.say("wlan", f"hey! watching {iface} for you. what should we diagnose?")
     last_report = DEFAULT_OUT
-    HELP = ("scan .......... list nearby networks\n"
+    HELP = ("check ......... verify tools + permissions (check-deps)\n"
+            "scan .......... list nearby networks\n"
             "info .......... current connection summary\n"
             "report ........ generate HTML report (report -o /tmp/x.html)\n"
             "open .......... open last report in browser\n"
@@ -859,6 +1021,11 @@ def cmd_chat(iface, use_color=True, banner=True):
         elif cmd == "log":
             for e in chat.entries:
                 print(f"[{e['t']}] {e['role']:>4} | {e['text']}")
+        elif cmd in ("check", "doctor", "check-deps"):
+            chat.say("wlan", "checking your tools + permissions…")
+            code = print_check_report(check_capabilities(iface), use_color=use_color)
+            chat.say("wlan", "all good — say 'scan' to start." if code == 0
+                     else "some checks need attention ^ — fix them, then say 'check' again.")
         elif cmd == "scan":
             chat.say("wlan", "on it — scanning the airwaves…")
             nets = get_wifi_networks(iface, rescan=True, log=chat)
@@ -909,7 +1076,7 @@ def main(argv=None):
     # legacy: `wlan-report out.html` (no subcommand) == `wlan-report report -o out.html`
     if argv is None:
         argv = sys.argv[1:]
-    if argv and argv[0] not in ("scan", "info", "chat", "report", "serve", "-h", "--help", "-V", "--version") and not argv[0].startswith("-"):
+    if argv and argv[0] not in ("scan", "info", "chat", "check-deps", "doctor", "report", "serve", "-h", "--help", "-V", "--version") and not argv[0].startswith("-"):
         argv = ["report", "-o"] + argv
     args = build_parser().parse_args(argv)
     cmd = args.cmd or "report"  # default when only global flags given
@@ -924,6 +1091,15 @@ def main(argv=None):
     if cmd == "chat":
         cmd_chat(iface, use_color=use_color, banner=want_banner)
         return
+
+    if cmd in ("check-deps", "doctor"):
+        if want_banner:
+            show_banner(use_color=use_color)
+        checks = check_capabilities(getattr(args, "iface", None))
+        if getattr(args, "json", False):
+            print(json.dumps(checks, indent=2))
+            sys.exit(0 if all(c["ok"] or c["level"] == "optional" for c in checks) else 1)
+        sys.exit(print_check_report(checks, use_color=use_color))
 
     if want_banner:
         show_banner(use_color=use_color)

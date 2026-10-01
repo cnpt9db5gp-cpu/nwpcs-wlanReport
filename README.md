@@ -9,21 +9,38 @@ chatbox mode.
 
 ## Requirements
 
-- Linux with NetworkManager (`nmcli`), `iw`, `ip`, `ping`, `journalctl`
+- Linux with NetworkManager (`nmcli`), `iw`, `ip` (+ optional `ping`, `journalctl`, `lspci`)
 - Python 3.9+ (stdlib only — no dependencies)
+- A Wi-Fi adapter with driver loaded. Missing/optional pieces degrade gracefully;
+  run `wlan-report check-deps` first — it tells you exactly what's absent and how
+  to install it on your distro (Arch/Debian/Fedora families).
 
 ## Install
 
+One-liner (installs to `~/.local/bin`, then runs the dependency check):
+
 ```bash
-# clone and put the CLI on your PATH
-git clone https://github.com/<you>/nwpcs-wlanReport.git
+curl -fsSL https://raw.githubusercontent.com/cnpt9db5gp-cpu/nwpcs-wlanReport/main/install.sh | bash
+```
+
+Or manually:
+
+```bash
+git clone https://github.com/cnpt9db5gp-cpu/nwpcs-wlanReport.git
 cd nwpcs-wlanReport
 install -m755 wlan-report ~/.local/bin/wlan-report
+wlan-report check-deps
 ```
+
+> The event-log section needs journal read access. If `check-deps` reports the
+> journal as LIMITED, run `sudo usermod -aG systemd-journal $USER`, re-login,
+> and re-run. Everything else keeps working without it.
 
 ## Usage
 
 ```bash
+wlan-report check-deps                     # verify tools + permissions first
+wlan-report check-deps --json              # machine-readable readiness
 wlan-report scan                          # terminal table (like netsh wlan show networks)
 wlan-report scan --json --limit 10 --sort signal|channel|ssid
 wlan-report info                          # current connection summary
@@ -46,8 +63,13 @@ you> open
 you> exit
 ```
 
-Commands: `scan | info | report [-o file] | open | serve [port] | log | clear | help | exit`.
+Commands: `check | scan | info | report [-o file] | open | serve [port] | log | clear | help | exit`.
 The transcript is saved to `~/wlan-report-chat.log`.
+
+### Sharing reports
+
+The HTML embeds nearby SSIDs/BSSIDs plus your local IP and MAC. Fine for
+personal use — think twice before posting a raw report publicly.
 
 ## Report contents
 
@@ -70,6 +92,7 @@ commands (Windows parity table included).
 ```
 nwpcs-wlanReport/
 ├── wlan-report   # the CLI (single-file, executable, stdlib-only)
+├── install.sh    # one-line installer (curl … | bash)
 ├── README.md
 ├── LICENSE
 └── .gitignore
