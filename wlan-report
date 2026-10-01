@@ -40,7 +40,7 @@ import threading
 import time
 import webbrowser
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 DEFAULT_OUT = str(pathlib.Path.home() / "wlan-report.html")
 
 # ------------------------------------------------- ASCII art + chat UX
@@ -685,7 +685,7 @@ def render_html(data, log_minutes=60):
         bar_w = max(0, min(100, sig))
         color = "#16a34a" if sig >= 65 else ("#ca8a04" if sig >= 45 else ("#ea580c" if sig >= 25 else "#dc2626"))
         dbm = signal_to_dbm(sig)
-        star = "★" if n.get("IN-USE") == "*" else ""
+        star = "●" if n.get("IN-USE") == "*" else ""
         rows.append(
             f'<tr class="{cls}"><td>{star}</td>'
             f'<td><strong>{esc(n["SSID_DISP"])}</strong><div class="muted mono">{esc(n["BSSID"])}</div></td>'
@@ -734,38 +734,40 @@ def render_html(data, log_minutes=60):
 <title>Wi-Fi Diagnostic Report — {esc(hostname)}</title>
 <style>
 :root{{--bg:#04060b;--card:#0b1120;--muted:#8ea0c2;--line:#1e2a45;--accent:#6d9bff;--text:#e8eefb}}
-*{{box-sizing:border-box}}body{{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;background:var(--bg);color:var(--text)}}
-header{{background:linear-gradient(135deg,#020409 0%,#0a1430 55%,#12224d 100%);color:#fff;padding:28px 24px;border-bottom:1px solid #22345c}}
-header h1{{margin:0 0 6px;font-size:24px;text-shadow:0 0 18px rgba(109,155,255,.45)}}header p{{margin:2px 0;opacity:.9}}
+*{{box-sizing:border-box}}body{{margin:0;font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.45}}
+header{{background:#060b18;color:#fff;padding:18px 22px;border-bottom:1px solid #22345c}}
+header h1{{margin:0 0 4px;font-size:20px;font-weight:600}}header p{{margin:2px 0;opacity:.85;font-size:13px}}
 header code{{color:#9dbcff}}
-.wrap{{max-width:1100px;margin:-18px auto 40px;padding:0 16px}}
-.card{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin:14px 0;box-shadow:0 4px 24px rgba(0,0,0,.55)}}
-.card h2{{margin:0 0 12px;font-size:18px;border-bottom:2px solid var(--line);padding-bottom:8px;color:#f2f6ff}}
-.card h3{{color:#dbe6ff}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}}
-.kpi{{background:#0e1628;border:1px solid var(--line);border-radius:10px;padding:12px}}
-.kpi .v{{font-size:20px;font-weight:700;color:#fff}}.kpi .l{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}}
-table{{width:100%;border-collapse:collapse;font-size:14px}}th,td{{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}}
-th{{background:#0e1628;position:sticky;top:0;color:#cdd9f2}}tr.cur{{background:#122441}}
-.muted{{color:var(--muted);font-size:12px}}.mono{{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}}
+.wrap{{max-width:1100px;margin:-12px auto 32px;padding:0 16px}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:10px 0;box-shadow:0 2px 12px rgba(0,0,0,.5)}}
+.card h2{{margin:0 0 10px;font-size:15px;font-weight:600;border-bottom:1px solid var(--line);padding-bottom:6px;color:#f2f6ff}}
+.card h3{{color:#dbe6ff;font-size:13px;margin:10px 0 4px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}}
+.kpi{{background:#0e1628;border:1px solid var(--line);border-radius:8px;padding:10px 12px}}
+.kpi .v{{font-size:18px;font-weight:600;color:#fff}}.kpi .l{{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}}
+.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;background:#4ade80;margin-right:6px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}}
+th{{background:#0e1628;position:sticky;top:0;color:#cdd9f2;font-weight:600;font-size:12px}}tr.cur{{background:#122441}}
+.muted{{color:var(--muted);font-size:12px}}.mono{{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}}
 code{{color:#9dbcff}}
-.sig{{height:8px;background:#1a2540;border-radius:99px;overflow:hidden;min-width:110px}}.sigfill{{height:100%}}
-.hrow{{display:flex;align-items:center;gap:10px;margin:6px 0}}.hbar{{flex:1;height:12px;background:#1a2540;border-radius:99px;overflow:hidden}}.hfill{{height:100%;background:var(--accent);box-shadow:0 0 8px rgba(109,155,255,.6)}}.sigfill2{{background:linear-gradient(90deg,#22c55e,#eab308,#ef4444)}}
+#nets td:first-child{{color:var(--accent);font-size:11px}}
+.sig{{height:6px;background:#1a2540;border-radius:99px;overflow:hidden;min-width:100px}}.sigfill{{height:100%}}
+.hrow{{display:flex;align-items:center;gap:8px;margin:5px 0}}.hbar{{flex:1;height:10px;background:#1a2540;border-radius:99px;overflow:hidden}}.hfill{{height:100%;background:var(--accent)}}.sigfill2{{background:linear-gradient(90deg,#22c55e,#eab308,#ef4444)}}
 .ch{{min-width:52px}}.ssid{{min-width:220px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-pre{{background:#020409;color:#d7e3fa;padding:14px;border-radius:10px;overflow:auto;font-size:12px;max-height:380px;border:1px solid var(--line)}}
+pre{{background:#020409;color:#d7e3fa;padding:10px 12px;border-radius:8px;overflow:auto;font-size:12px;max-height:340px;border:1px solid var(--line)}}
 .badge{{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;background:#1a2540;color:#9db1d8;margin-right:6px}}
 li.good .badge{{background:#052e1b;color:#4ade80}}li.warn .badge{{background:#3a2a04;color:#facc15}}li.bad .badge{{background:#3f0d0d;color:#f87171}}li.info .badge{{background:#0b2447;color:#7db4ff}}
-ul.recs{{list-style:none;padding:0}}ul.recs li{{padding:10px;border:1px solid var(--line);border-radius:10px;margin:8px 0;background:#0e1628}}
-.toolbar{{display:flex;gap:8px;margin-bottom:10px}}input[type=search]{{flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#0e1628;color:var(--text)}}
-footer{{color:var(--muted);font-size:12px;text-align:center;margin:20px}}
+ul.recs{{list-style:none;padding:0;margin:0}}ul.recs li{{padding:8px 10px;border:1px solid var(--line);border-radius:8px;margin:6px 0;background:#0e1628}}
+.toolbar{{display:flex;gap:8px;margin-bottom:8px}}input[type=search]{{flex:1;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:#0e1628;color:var(--text)}}
+footer{{color:var(--muted);font-size:12px;text-align:center;margin:14px}}
 @media print{{header{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}.wrap{{margin:0;max-width:none}}}}
 </style></head><body>
-<header><h1>📶 Wi-Fi Diagnostic Report</h1>
+<header><h1>Wi-Fi Diagnostic Report</h1>
 <p>Host <strong>{esc(hostname)}</strong> · Interface <strong>{esc(iface)}</strong> · Generated {esc(now_local.strftime("%Y-%m-%d %H:%M:%S %Z"))} ({esc(now_utc.strftime("%Y-%m-%d %H:%M UTC"))})</p>
 <p>Connected to <strong>{cur_ssid}</strong> ({cur_bssid}) · {len(nets)} networks found · Linux equivalent of <code>netsh wlan show networks</code> + <code>netsh wlanreport</code></p></header>
 <div class="wrap">
 <div class="card"><h2>Summary</h2><div class="grid">
-<div class="kpi"><div class="l">Status</div><div class="v">✅ Connected</div><div class="muted">{cur_ssid} · {esc(gen_state)}</div></div>
+<div class="kpi"><div class="l">Status</div><div class="v"><span class="dot"></span>Connected</div><div class="muted">{cur_ssid} · {esc(gen_state)}</div></div>
 <div class="kpi"><div class="l">Signal</div><div class="v">{cur_dbm if cur_dbm is not None else "?"} dBm</div><div class="muted">{sig_pct}% · {sig_qual}</div></div>
 <div class="kpi"><div class="l">Link speed</div><div class="v mono" style="font-size:15px">{esc(rx_rate)}</div><div class="muted">RX · TX {esc(tx_rate)}</div></div>
 <div class="kpi"><div class="l">Channel / Band</div><div class="v mono">ch {esc(cur_chan)}</div><div class="muted">{esc(cur_bandline)}</div></div>
@@ -796,16 +798,16 @@ footer{{color:var(--muted);font-size:12px;text-align:center;margin:20px}}
 <tr><td>IPv6</td><td class="mono">{esc(dev_kv.get("IP6.ADDRESS[1]", "-"))} · gw {esc(dev_kv.get("IP6.GATEWAY", "-"))}</td></tr>
 <tr><td>Routes</td><td class="mono">{esc(data["ip_route"])}<br>{esc(data["ip6_route"])}</td></tr>
 </table>
-<h3 style="margin:14px 0 6px">iw link</h3><pre>{esc(iw_link)}</pre>
-<h3 style="margin:14px 0 6px">iw station dump</h3><pre>{esc(data["iw_station"])}</pre>
+<h3 style="margin:10px 0 4px">iw link</h3><pre>{esc(iw_link)}</pre>
+<h3 style="margin:10px 0 4px">iw station dump</h3><pre>{esc(data["iw_station"])}</pre>
 </div>
 <div class="card"><h2>All nearby networks ({len(nets)})</h2>
 <div class="toolbar"><input type="search" id="q" placeholder="Filter by SSID / BSSID / channel / security…"></div>
 <table id="nets"><thead><tr><th></th><th>Network (SSID / BSSID)</th><th>Ch</th><th>Freq / Band</th><th>Signal</th><th>Max rate</th><th>Security</th><th>Mode</th></tr></thead>
 <tbody>{rows_html}</tbody></table>
-<p class="muted">★ = current connection. Signal % is from NetworkManager; dBm ≈ %/2 − 100 except the live <code>iw</code> reading ({cur_dbm} dBm). Sorted by signal.</p></div>
+<p class="muted">● = current connection. Signal % is from NetworkManager; dBm ≈ %/2 − 100 except the live <code>iw</code> reading ({cur_dbm} dBm). Sorted by signal.</p></div>
 <div class="card"><h2>Channel utilization</h2>{chan_bars_html}
-<h2 style="margin-top:16px">Signal ranking (top 12)</h2>{sig_bars_html}</div>
+<h2 style="margin-top:12px">Signal ranking (top 12)</h2>{sig_bars_html}</div>
 <div class="card"><h2>Band &amp; security breakdown</h2><div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
 <div><h3>Bands</h3><table>{band_rows_html}</table></div>
 <div><h3>Security</h3><table>{sec_rows_html}</table></div></div>
