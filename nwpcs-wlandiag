@@ -40,7 +40,7 @@ import threading
 import time
 import webbrowser
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 DEFAULT_OUT = str(pathlib.Path.home() / "nwpcs-wlandiag.html")
 
 # ------------------------------------------------- ASCII art + chat UX
@@ -997,6 +997,17 @@ def build_parser():
     return p
 
 
+def build_report_file(out, iface, chat):
+    """Run the full diagnostic and write the HTML report. Returns (path, count)."""
+    chat.say("wlan", f"building the full HTML report → {out} …")
+    data = collect_all(iface, rescan=True, do_ping=True, log=chat)
+    html_doc = render_html(data)
+    op = pathlib.Path(out)
+    op.parent.mkdir(parents=True, exist_ok=True)
+    op.write_text(html_doc, encoding="utf-8")
+    return str(op), len(data["nets"])
+
+
 def cmd_chat(iface, use_color=True, banner=True):
     """Interactive chatbox loop: `you>` prompt, wlan-bot answers + runs scans."""
     chat = ChatLog(use_color=use_color)
@@ -1010,7 +1021,7 @@ def cmd_chat(iface, use_color=True, banner=True):
             "scan .......... list nearby networks\n"
             "info .......... current connection summary\n"
             "report ........ generate HTML report (report -o /tmp/x.html)\n"
-            "open .......... open last report in browser\n"
+            "open .......... open report in browser (builds one if missing)\n"
             "serve [port] .. serve last report over HTTP\n"
             "log ........... show this chat transcript\n"
             "clear ......... clear the screen\n"
@@ -1062,24 +1073,25 @@ def cmd_chat(iface, use_color=True, banner=True):
                     out = rest[1]
                 elif not rest[0].startswith("-"):
                     out = rest[0]
-            chat.say("wlan", f"building the full HTML report → {out} …")
-            data = collect_all(iface, rescan=True, do_ping=True, log=chat)
-            html_doc = render_html(data)
-            op = pathlib.Path(out)
-            op.parent.mkdir(parents=True, exist_ok=True)
-            op.write_text(html_doc, encoding="utf-8")
-            last_report = str(op)
-            chat.box("report ready", f"{op}\n{len(data['nets'])} networks — open it in a browser!")
+            last_report, n = build_report_file(out, iface, chat)
+            chat.box("report ready", f"{last_report}\n{n} networks — open it in a browser!")
         elif cmd == "open":
+            if not pathlib.Path(last_report).exists():
+                chat.say("wlan", "no report yet — building one first, then opening…")
+                last_report, n = build_report_file(last_report, iface, chat)
+                chat.box("report ready", f"{last_report}\n{n} networks — opening it now!")
             uri = pathlib.Path(last_report).resolve().as_uri()
             chat.say("wlan", f"opening {uri}")
             if not open_in_browser(uri):
                 chat.say("wlan", f"could not auto-open — paste this in a browser: {uri}")
         elif cmd == "serve":
-            port = int(rest[0]) if rest and rest[0].isdigit() else 8000
-            chat.say("wlan", f"serving {last_report} on port {port} (Ctrl+C to stop)…")
-            serve_file(last_report, port=port, open_browser=True)
-            chat.say("wlan", "server stopped — back in chat. what next?")
+            if not pathlib.Path(last_report).exists():
+                chat.say("wlan", "no report yet — say 'report' first, then I can serve it.")
+            else:
+                port = int(rest[0]) if rest and rest[0].isdigit() else 8000
+                chat.say("wlan", f"serving {last_report} on port {port} (Ctrl+C to stop)…")
+                serve_file(last_report, port=port, open_browser=True)
+                chat.say("wlan", "server stopped — back in chat. what next?")
         else:
             chat.say("wlan", f"hmm, I don't know '{cmd}'. try: help")
     try:
