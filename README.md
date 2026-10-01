@@ -78,8 +78,7 @@ Summary KPIs, recommendations (congestion, weak WPA1/TKIP, band advice),
 adapter details, current connection + `iw link`/`station` dumps, sortable and
 filterable network table, channel utilization + signal ranking charts,
 band/security breakdown, ping/DNS/route diagnostics, NetworkManager event log,
-session chat log with an in-browser notes chatbox, and the exact collection
-commands (Windows parity table included).
+and the exact collection commands (Windows parity table included).
 
 ## Windows parity
 

@@ -40,7 +40,7 @@ import threading
 import time
 import webbrowser
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 DEFAULT_OUT = str(pathlib.Path.home() / "wlan-report.html")
 
 # ------------------------------------------------- ASCII art + chat UX
@@ -728,20 +728,6 @@ def render_html(data, log_minutes=60):
     driver = dev_kv.get("GENERAL.DRIVER", "")
     fw = dev_kv.get("GENERAL.FIRMWARE-VERSION", "")
 
-    chat_entries = data.get("chat", []) or []
-    if chat_entries:
-        bubbles = []
-        for e in chat_entries[-60:]:
-            who = e.get("role", "wlan")
-            mine = " me" if who == "you" else ""
-            bubbles.append(
-                f'<div class="bubble{mine}"><span class="who">{esc(who)} · {esc(e.get("t", ""))}</span>'
-                f'{esc(e.get("text", ""))}</div>')
-        chat_html = "".join(bubbles)
-    else:
-        chat_html = ('<div class="muted">No session log recorded — generate with '
-                     '<code>wlan-report report</code> to see the progress + interaction here.</div>')
-
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -768,11 +754,6 @@ pre{{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:10px;overflow:a
 li.good .badge{{background:#dcfce7;color:#166534}}li.warn .badge{{background:#fef9c3;color:#854d0e}}li.bad .badge{{background:#fee2e2;color:#991b1b}}li.info .badge{{background:#dbeafe;color:#1e40af}}
 ul.recs{{list-style:none;padding:0}}ul.recs li{{padding:10px;border:1px solid var(--line);border-radius:10px;margin:8px 0;background:#f8fafc}}
 .toolbar{{display:flex;gap:8px;margin-bottom:10px}}input[type=search]{{flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:8px}}
-.chatlog{{display:flex;flex-direction:column;gap:8px;max-height:340px;overflow:auto;background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:12px}}
-.bubble{{max-width:85%;background:#fff;border:1px solid var(--line);border-radius:4px 14px 14px 14px;padding:8px 12px;font-size:13px;white-space:pre-wrap;word-break:break-word}}
-.bubble.me{{align-self:flex-end;background:#eff6ff;border-color:#bfdbfe;border-radius:14px 4px 14px 14px}}
-.bubble .who{{display:block;font-size:11px;color:var(--muted);margin-bottom:2px}}
-.chatbox{{display:flex;gap:8px;margin-top:10px}}.chatbox input{{flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:8px}}.chatbox button{{padding:8px 14px;border:0;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}}
 footer{{color:var(--muted);font-size:12px;text-align:center;margin:20px}}
 @media print{{header{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}.wrap{{margin:0;max-width:none}}}}
 </style></head><body>
@@ -791,10 +772,6 @@ footer{{color:var(--muted);font-size:12px;text-align:center;margin:20px}}
 <div class="kpi"><div class="l">Adapter</div><div class="v" style="font-size:14px">{esc(product)}</div><div class="muted mono">{esc(driver)} · {esc(fw)}</div></div>
 </div></div>
 <div class="card"><h2>Recommendations</h2><ul class="recs">{rec_html}</ul></div>
-<div class="card"><h2>Session chat log — progress &amp; interaction</h2>
-<div class="chatlog" id="chatlog">{chat_html}</div>
-<div class="chatbox"><input id="chatinput" placeholder="Type a note here and press Enter — kept in this browser…"><button id="chatsend">Send</button></div>
-<p class="muted">Live transcript of this diagnostic run. Notes you type above are stored locally in your browser (localStorage) and never leave your machine.</p></div>
 <div class="card"><h2>Adapter &amp; System</h2>
 <table><tr><th style="width:260px">Item</th><th>Value</th></tr>
 <tr><td>Adapter</td><td>{esc(dev_kv.get("GENERAL.PRODUCT", "-"))} — {esc(dev_kv.get("GENERAL.VENDOR", ""))} <span class="muted">({esc(dev_kv.get("GENERAL.PATH", ""))})</span></td></tr>
@@ -852,11 +829,6 @@ journalctl -u NetworkManager --since "{log_minutes} min ago"</pre>
 <script>
 var q=document.getElementById('q');
 q.addEventListener('input',function(){{var s=q.value.toLowerCase();document.querySelectorAll('#nets tbody tr').forEach(function(tr){{tr.style.display=tr.innerText.toLowerCase().includes(s)?'':'none'}})}});
-var chatlog=document.getElementById('chatlog'),chatinput=document.getElementById('chatinput'),chatsend=document.getElementById('chatsend');
-function addNote(t,save){{var d=document.createElement('div');d.className='bubble me';var w=document.createElement('span');w.className='who';w.textContent='you · note';d.appendChild(w);d.appendChild(document.createTextNode(t));chatlog.appendChild(d);chatlog.scrollTop=chatlog.scrollHeight;if(save!==false){{try{{var k='wlan-report-notes';var a=JSON.parse(localStorage.getItem(k)||'[]');a.push(t);localStorage.setItem(k,JSON.stringify(a))}}catch(e){{}}}}}}
-chatsend.addEventListener('click',function(){{if(chatinput.value.trim()){{addNote(chatinput.value.trim());chatinput.value=''}}}});
-chatinput.addEventListener('keydown',function(e){{if(e.key==='Enter'&&chatinput.value.trim()){{addNote(chatinput.value.trim());chatinput.value=''}}}});
-try{{(JSON.parse(localStorage.getItem('wlan-report-notes')||'[]')).forEach(function(t){{addNote(t,false)}})}}catch(e){{}}
 </script>
 </body></html>"""
 
@@ -1087,7 +1059,6 @@ def cmd_chat(iface, use_color=True, banner=True):
                     out = rest[0]
             chat.say("wlan", f"building the full HTML report → {out} …")
             data = collect_all(iface, rescan=True, do_ping=True, log=chat)
-            data["chat"] = list(chat.entries)
             html_doc = render_html(data)
             op = pathlib.Path(out)
             op.parent.mkdir(parents=True, exist_ok=True)
@@ -1203,7 +1174,6 @@ def main(argv=None):
     chat.say("wlan", "on it — running the full diagnostic…")
     data = collect_all(iface, rescan=rescan, do_ping=do_ping, log_minutes=log_minutes, log=chat)
     chat.step("render", "rendering HTML report")
-    data["chat"] = list(chat.entries)
     html_doc = render_html(data, log_minutes=log_minutes)
     chat.done("render", "HTML rendered")
     out_path = pathlib.Path(out)
