@@ -12,7 +12,7 @@ chatbox mode. Use `--no-banner` / `--no-color` for calm, script-friendly output.
 - Linux with NetworkManager (`nmcli`), `iw`, `ip` (+ optional `ping`, `journalctl`, `lspci`)
 - Python 3.9+ (stdlib only — no dependencies)
 - A Wi-Fi adapter with driver loaded. Missing/optional pieces degrade gracefully;
-  run `wlan-report check-deps` first — it tells you exactly what's absent and how
+  run `nwpcs-wlandiag check-deps` first — it tells you exactly what's absent and how
   to install it on your distro (Arch/Debian/Fedora families).
 
 ## Install
@@ -28,8 +28,8 @@ Or manually:
 ```bash
 git clone https://github.com/cnpt9db5gp-cpu/nwpcs-wlanReport.git
 cd nwpcs-wlanReport
-install -m755 wlan-report ~/.local/bin/wlan-report
-wlan-report check-deps
+install -m755 nwpcs-wlandiag ~/.local/bin/nwpcs-wlandiag
+nwpcs-wlandiag check-deps
 ```
 
 > The event-log section needs journal read access. If `check-deps` reports the
@@ -38,26 +38,40 @@ wlan-report check-deps
 
 ## Usage
 
+Just type `nwpcs-wlandiag` with no arguments — it stays inside the interactive
+mode until you type `exit`, so you only ever type short commands (`scan`,
+`report`, `open`):
+
+```
+$ nwpcs-wlandiag
+you> scan
+you> report
+you> open
+you> exit
+```
+
+Or run one-shot commands from your shell:
+
 ```bash
-wlan-report check-deps                     # verify tools + permissions first
-wlan-report check-deps --json              # machine-readable readiness
-wlan-report scan                          # terminal table (like netsh wlan show networks)
-wlan-report scan --json --limit 10 --sort signal|channel|ssid
-wlan-report info                          # current connection summary
-wlan-report chat                          # interactive chatbox mode
-wlan-report report                        # -> ~/wlan-report.html + -data.json + -chat.log
-wlan-report report -o /tmp/wifi.html --open
-wlan-report open                            # open ~/wlan-report.html in your browser
-wlan-report report --serve --port 8000    # generate + serve + open browser
-wlan-report serve ~/wlan-report.html --port 8000 --open
-wlan-report --iface wlo1 report -o out.html
-wlan-report --no-banner scan              # skip the ASCII banner
+nwpcs-wlandiag check-deps                     # verify tools + permissions first
+nwpcs-wlandiag check-deps --json              # machine-readable readiness
+nwpcs-wlandiag scan                          # terminal table (like netsh wlan show networks)
+nwpcs-wlandiag scan --json --limit 10 --sort signal|channel|ssid
+nwpcs-wlandiag info                          # current connection summary
+nwpcs-wlandiag chat                          # interactive chatbox mode
+nwpcs-wlandiag report                        # -> ~/nwpcs-wlandiag.html + -data.json + -chat.log
+nwpcs-wlandiag report -o /tmp/wifi.html --open
+nwpcs-wlandiag open                            # open ~/nwpcs-wlandiag.html in your browser
+nwpcs-wlandiag report --serve --port 8000    # generate + serve + open browser
+nwpcs-wlandiag serve ~/nwpcs-wlandiag.html --port 8000 --open
+nwpcs-wlandiag --iface wlo1 report -o out.html
+nwpcs-wlandiag --no-banner scan              # skip the ASCII banner
 ```
 
 ### Chat mode
 
 ```
-$ wlan-report chat
+$ nwpcs-wlandiag chat
 you> scan
 you> report -o /tmp/wifi.html
 you> open
@@ -65,7 +79,7 @@ you> exit
 ```
 
 Commands: `check | scan | info | report [-o file] | open | serve [port] | log | clear | help | exit`.
-The transcript is saved to `~/wlan-report-chat.log`.
+The transcript is saved to `~/nwpcs-wlandiag-chat.log`.
 
 ### Sharing reports
 
@@ -84,21 +98,21 @@ and the exact collection commands (Windows parity table included).
 
 | Windows                          | This tool              |
 |----------------------------------|------------------------|
-| `netsh wlan show networks mode=bssid` | `wlan-report scan` |
-| `netsh wlanreport`               | `wlan-report report --open` |
+| `netsh wlan show networks mode=bssid` | `nwpcs-wlandiag scan` |
+| `netsh wlanreport`               | `nwpcs-wlandiag report --open` |
 
 ## Layout
 
 ```
 nwpcs-wlanReport/
-├── wlan-report   # the CLI (single-file, executable, stdlib-only)
+├── nwpcs-wlandiag   # the CLI (single-file, executable, stdlib-only)
 ├── install.sh    # one-line installer (curl … | bash)
 ├── README.md
 ├── LICENSE
 └── .gitignore
 ```
 
-Generated artifacts (`wlan-report.html`, `*-data.json`, `*-chat.log`) are
+Generated artifacts (`nwpcs-wlandiag.html`, `*-data.json`, `*-chat.log`) are
 git-ignored — they belong on your machine, not in the repo.
 
 ## License
