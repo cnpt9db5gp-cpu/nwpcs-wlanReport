@@ -1,0 +1,1002 @@
+#!/usr/bin/env python3
+"""wlan-report — Linux equivalent of `netsh wlan show networks` + `netsh wlanreport`.
+
+Scan nearby Wi-Fi networks and generate a single-file HTML report you can
+open in any browser (file:// — no server needed), or serve over HTTP.
+
+Examples:
+  wlan-report scan                          # terminal table of nearby networks
+  wlan-report scan --json                   # machine-readable scan
+  wlan-report info                          # current connection summary
+  wlan-report chat                          # interactive chatbox mode
+  wlan-report report                         # -> ~/wlan-report.html
+  wlan-report report -o /tmp/wifi.html --open
+  wlan-report report --serve --port 8000    # generate + serve + open browser
+  wlan-report serve ~/wlan-report.html --port 8000 --open
+  wlan-report --iface wlo1 report -o out.html
+  wlan-report --no-banner scan              # skip the ASCII banner
+
+Windows parity:
+  netsh wlan show networks mode=bssid  <=>  wlan-report scan
+  netsh wlanreport                   <=>  wlan-report report --open
+"""
+import argparse
+import collections
+import datetime
+import functools
+import html
+import http.server
+import json
+import pathlib
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+
+VERSION = "1.1.0"
+DEFAULT_OUT = str(pathlib.Path.home() / "wlan-report.html")
+
+# ------------------------------------------------- ASCII art + chat UX
+
+BANNER = r"""
+  ___       __  ___       _   _   _   ____  _____ ____   ___  ____ _____
+  \ \     / / | |     / \ | \ | | |  _ \| ____|  _ \ / _ \|  _ \|_   _|
+   \ \ /\ / /  | |    / _ \ |  \| | | |_) |  _| | |_) | | | | |_) | | |
+    \ V  V /   | |___/ ___ \| |\  | |  _ <| |___|  __/| |_| |  _ <  | |
+     \_/\_/    |_____/_/   \_\_| \_| |_| \_\_____|_|    \___/|_| \_\ |_|
+   ((  wifi scanner + html report  ::  netsh wlanreport for linux  ))
+"""
+
+_ANSI = {"reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+         "cyan": "\033[36m", "green": "\033[32m", "yellow": "\033[33m",
+         "red": "\033[31m", "magenta": "\033[35m", "blue": "\033[34m"}
+
+_ROLE_COLOR = {"you": "magenta", "wlan": "cyan", "sys": "dim",
+               "step": "blue", "done": "green", "ok": "green",
+               "warn": "yellow", "err": "red"}
+
+
+def _color_enabled(no_color=False):
+    if no_color:
+        return False
+    import os
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def show_banner(use_color=True, stream=None):
+    out = stream or sys.stdout
+    art = BANNER.strip("\n")
+    if use_color:
+        out.write(_ANSI["bold"] + _ANSI["cyan"] + art + _ANSI["reset"] + "\n")
+        out.write(_ANSI["dim"] + f"  wlan-report v{VERSION}  |  scan -> report -> browse"
+                  + _ANSI["reset"] + "\n")
+    else:
+        out.write(art + "\n")
+        out.write(f"  wlan-report v{VERSION}  |  scan -> report -> browse\n")
+    out.flush()
+
+
+class ChatLog:
+    """Chat-style progress + interaction transcript.
+
+    Prints chat-like lines to the terminal while recording every entry so
+    the same conversation can be embedded in the HTML report ('Session chat
+    log') and saved to a `-chat.log` text file.
+    Roles: you, wlan, sys, step, done, ok, warn, err.
+    """
+
+    def __init__(self, use_color=True, stream=None, quiet=False):
+        self.use_color = use_color
+        self.stream = stream or sys.stdout
+        self.quiet = quiet
+        self.entries = []
+        self._t0 = time.time()
+        self._steps = {}
+
+    def _paint(self, color, text):
+        if not self.use_color:
+            return text
+        return _ANSI.get(color, "") + text + _ANSI["reset"]
+
+    def _emit(self, text):
+        if not self.quiet:
+            self.stream.write(text + "\n")
+            self.stream.flush()
+
+    def say(self, role, text):
+        ts = datetime.datetime.now().astimezone().strftime("%H:%M:%S")
+        self.entries.append({"t": ts, "role": role, "text": text})
+        mark = {"you": "you >", "wlan": "wlan|", "sys": "sys |",
+                "step": " -- >", "done": " <--", "ok": " ok |",
+                "warn": " !! |", "err": "FAIL|"}.get(role, "    |")
+        self._emit(f"{self._paint('dim', '[' + ts + ']')} "
+                   f"{self._paint(_ROLE_COLOR.get(role, 'dim'), mark)} {text}")
+
+    def step(self, key, text):
+        self._steps[key] = time.time()
+        self.say("step", text + " ...")
+
+    def done(self, key, text=""):
+        dt = time.time() - self._steps.pop(key, time.time())
+        extra = f" ({dt:.1f}s)" if dt < 120 else f" ({dt / 60:.1f} min)"
+        self.say("done", (text + extra) if text else "done" + extra)
+
+    def box(self, title, body):
+        lines = str(body).splitlines() or [""]
+        width = max([len(title) + 6] + [len(l) + 4 for l in lines] + [30])
+        width = min(width, 76)
+        bar = "+" + "-" * (width - 2) + "+"
+        self._emit(self._paint("cyan", bar))
+        self._emit(self._paint("cyan", "| ") + self._paint("bold", title.upper())
+                   + " " * max(0, width - 4 - len(title)) + self._paint("cyan", "|"))
+        self._emit(self._paint("cyan", bar))
+        inner = width - 4
+        wrapped = []
+        for line in lines:
+            words, cur_line = str(line).split(" "), ""
+            if not words or words == [""]:
+                wrapped.append("")
+                continue
+            for w in words:
+                while len(w) > inner:  # hard-split overlong words
+                    if cur_line:
+                        wrapped.append(cur_line)
+                        cur_line = ""
+                    wrapped.append(w[:inner])
+                    w = w[inner:]
+                trial = (cur_line + " " + w).strip()
+                if len(trial) <= inner:
+                    cur_line = trial
+                else:
+                    wrapped.append(cur_line)
+                    cur_line = w
+            wrapped.append(cur_line)
+        for chunk in wrapped:
+            self._emit(self._paint("cyan", "| ") + chunk
+                       + " " * (inner - len(chunk)) + self._paint("cyan", " |"))
+        self._emit(self._paint("cyan", bar))
+        self.entries.append({"t": datetime.datetime.now().astimezone().strftime("%H:%M:%S"),
+                             "role": "sys", "text": f"[{title}] {body}"})
+
+    def save(self, path):
+        lines = [f"[{e['t']}] {e['role']:>4} | {e['text']}" for e in self.entries]
+        header = f"# wlan-report chat transcript v{VERSION} — {socket.gethostname()} — " \
+                 f"{datetime.datetime.now().astimezone().isoformat()}\n"
+        pathlib.Path(path).write_text(header + "\n".join(lines) + "\n", encoding="utf-8")
+        return str(path)
+
+# ---------------------------------------------------------------- utils
+
+def run(cmd, timeout=25):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = (r.stdout or "")
+        if r.stderr:
+            out += ("\n[stderr]\n" + r.stderr if out else r.stderr)
+        return out.strip(), r.returncode
+    except FileNotFoundError:
+        return f"[missing: {cmd[0]}]", 127
+    except subprocess.TimeoutExpired:
+        return "[timeout]", 124
+    except Exception as e:  # noqa: BLE001
+        return f"[error: {e}]", 1
+
+
+def detect_iface(hint=None):
+    if hint:
+        return hint
+    out, _ = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"], timeout=10)
+    wifi = []
+    for line in out.splitlines():
+        parts = line.strip().split(":")
+        if len(parts) >= 3 and parts[1] == "wifi":
+            wifi.append((parts[0], parts[2]))
+    for dev, state in wifi:  # prefer connected wifi
+        if state == "connected":
+            return dev
+    if wifi:
+        return wifi[0][0]
+    # fallback: first wireless iface from /sys
+    try:
+        for p in pathlib.Path("/sys/class/net").iterdir():
+            if (p / "wireless").exists():
+                return p.name
+    except Exception:  # noqa: BLE001
+        pass
+    return "wlo1"
+
+
+def parse_terse(line, nfields):
+    """Split nmcli --terse line on unescaped ':' (nmcli escapes ':' as '\\:')."""
+    PH = "\x00"
+    tmp = line.replace("\\:", PH).replace("\\\\", "\\")
+    parts = [p.replace(PH, ":") for p in tmp.split(":")]
+    if len(parts) < nfields:
+        parts += [""] * (nfields - len(parts))
+    elif len(parts) > nfields:
+        surplus = len(parts) - nfields
+        parts = [parts[0]] + [":".join(parts[1:2 + surplus])] + parts[2 + surplus:]
+    return parts
+
+
+def signal_to_dbm(sig_pct):
+    try:
+        return int(round(int(sig_pct) / 2 - 100))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def quality_label(sig):
+    try:
+        s = int(sig)
+    except Exception:  # noqa: BLE001
+        return "Unknown"
+    if s >= 80:
+        return "Excellent"
+    if s >= 65:
+        return "Very good"
+    if s >= 50:
+        return "Good"
+    if s >= 35:
+        return "Fair"
+    if s >= 20:
+        return "Weak"
+    return "Very weak"
+
+
+def sec_label(s):
+    s = (s or "").upper()
+    if "WPA3" in s and "WPA2" in s:
+        return "WPA2/WPA3 transitional"
+    if "WPA3" in s:
+        return "WPA3"
+    if "WPA2" in s and "WPA1" in s:
+        return "WPA1/WPA2 (legacy TKIP!)"
+    if "WPA2" in s:
+        return "WPA2"
+    if "WPA1" in s:
+        return "WPA1 (weak)"
+    if "WEP" in s:
+        return "WEP (insecure!)"
+    if s.strip() in ("", "--", "NONE"):
+        return "Open (no security!)"
+    return s or "Unknown"
+
+
+# ------------------------------------------------------------ collectors
+
+def get_wifi_networks(iface, rescan=True, log=None):
+    if rescan:
+        if log:
+            log.step("rescan", f"rescanning nearby networks on {iface}")
+        run(["nmcli", "device", "wifi", "rescan", "ifname", iface], timeout=15)
+        time.sleep(2)
+        if log:
+            log.done("rescan", "scan finished")
+    fields = ["IN-USE", "SSID", "BSSID", "MODE", "CHAN", "FREQ", "RATE", "SIGNAL", "BARS", "SECURITY"]
+    flag = "yes" if rescan else "no"
+    out, _ = run(["nmcli", "-t", "-f", ",".join(fields), "device", "wifi",
+                  "list", "ifname", iface, "--rescan", flag], timeout=30)
+    nets = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Error") or "no networks" in line.lower():
+            continue
+        d = dict(zip(fields, parse_terse(line, len(fields))))
+        try:
+            d["SIGNAL_INT"] = int(d["SIGNAL"]) if d["SIGNAL"].strip().isdigit() else -1
+        except Exception:  # noqa: BLE001
+            d["SIGNAL_INT"] = -1
+        d["SSID_DISP"] = d["SSID"] if d["SSID"] else "(hidden SSID)"
+        nets.append(d)
+    # band / bandwidth detail
+    df = ["SSID", "BSSID", "MODE", "CHAN", "BAND", "FREQ", "RATE", "BANDWIDTH", "SIGNAL", "SECURITY"]
+    out2, _ = run(["nmcli", "-t", "-f", ",".join(df), "device", "wifi",
+                   "list", "ifname", iface, "--rescan", "no"], timeout=20)
+    det = {}
+    for line in out2.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        dd = dict(zip(df, parse_terse(line, len(df))))
+        det[(dd["SSID"], dd["BSSID"])] = dd
+    for n in nets:
+        dd = det.get((n["SSID"], n["BSSID"]), {})
+        n["BAND"] = dd.get("BAND", "")
+        n["BANDWIDTH"] = dd.get("BANDWIDTH", "")
+        m = re.search(r"(\d+)", n.get("FREQ", ""))
+        n["FREQ_MHZ"] = int(m.group(1)) if m else 0
+        if not n["BAND"]:
+            f = n["FREQ_MHZ"]
+            if 2400 <= f < 2500:
+                n["BAND"] = "2.4 GHz"
+            elif 5000 <= f < 5900:
+                n["BAND"] = "5 GHz"
+            elif f >= 5900:
+                n["BAND"] = "6 GHz"
+        n["IFACE"] = iface
+    nets.sort(key=lambda x: x["SIGNAL_INT"], reverse=True)
+    if log:
+        top = f"top: {nets[0]['SSID_DISP']} ({nets[0]['SIGNAL_INT']}%)" if nets else "none found"
+        log.say("wlan", f"found {len(nets)} network(s) — {top}")
+    return nets
+
+
+def kv_parse(text):
+    d = {}
+    for line in text.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            d[k.strip()] = v.strip()
+    return d
+
+
+def parse_ping(txt):
+    m = re.search(r"(\d+) packets transmitted,\s*(\d+) received.*?(\d+)% packet loss"
+                  r".*?rtt min/avg/max/mdev =\s*([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)", txt, re.S)
+    if m:
+        return {"tx": m.group(1), "rx": m.group(2), "loss": m.group(3) + "%",
+                "min": m.group(4), "avg": m.group(5), "max": m.group(6), "mdev": m.group(7)}
+    m2 = re.search(r"(\d+)% packet loss", txt)
+    return {"tx": "?", "rx": "?", "loss": (m2.group(0) if m2 else "?"),
+            "min": "-", "avg": "-", "max": "-", "mdev": "-"}
+
+
+def collect_all(iface, rescan=True, do_ping=True, log_minutes=60, log=None):
+    def _step(k, m):
+        if log:
+            log.step(k, m)
+
+    def _done(k, m=""):
+        if log:
+            log.done(k, m)
+
+    _step("adapter", "reading adapter + link state")
+    general, _ = run(["nmcli", "general", "status"])
+    dev_status, _ = run(["nmcli", "device", "status"])
+    dev_show_txt, _ = run(["nmcli", "-f", "GENERAL,IP4,IP6,DHCP4", "device", "show", iface])
+    dev_kv = kv_parse(dev_show_txt)
+    iw_link, _ = run(["iw", "dev", iface, "link"])
+    iw_station, _ = run(["iw", "dev", iface, "station", "dump"])
+    lspci, _ = run(["lspci", "-k"])
+    proc_wireless, _ = run(["cat", "/proc/net/wireless"])
+    _done("adapter", "adapter + link state collected")
+
+    _step("nets", "scanning nearby networks")
+    nets = get_wifi_networks(iface, rescan=rescan, log=log)
+    _done("nets", f"{len(nets)} network(s) in range")
+
+    _step("net", "checking IP, routes + DNS")
+    ip_route, _ = run(["ip", "route", "show"])
+    ip6_route, _ = run(["ip", "-6", "route", "show"])
+    dns_conf, _ = run(["cat", "/etc/resolv.conf"])
+    resolvectl, _ = run(["resolvectl", "status", iface])
+    conn_active, _ = run(["nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE",
+                           "connection", "show", "--active"])
+    _done("net", "IP + DNS collected")
+
+    gw = dev_kv.get("IP4.GATEWAY", "192.168.1.1")
+    if do_ping:
+        _step("ping", f"pinging gateway {gw}, 8.8.8.8 + google.com (5 pkts each)")
+        ping_gw, _ = run(["ping", "-c", "5", "-W", "2", gw])
+        ping_ext, _ = run(["ping", "-c", "5", "-W", "2", "8.8.8.8"])
+        ping_dns, _ = run(["ping", "-c", "5", "-W", "2", "google.com"])
+        _done("ping", "latency probes finished")
+    else:
+        if log:
+            log.say("sys", "ping tests skipped (--no-ping)")
+        ping_gw = ping_ext = ping_dns = "ping skipped (--no-ping)"
+
+    _step("logs", f"reading NetworkManager journal (last {log_minutes} min)")
+    nm_logs, _ = run(["journalctl", "-u", "NetworkManager", "--since",
+                       f"{log_minutes} min ago", "--no-pager", "-o", "short-iso"], timeout=20)
+    _done("logs", "event history collected")
+    return {
+        "iface": iface, "general": general, "dev_status": dev_status,
+        "dev_kv": dev_kv, "dev_show_txt": dev_show_txt,
+        "iw_link": iw_link, "iw_station": iw_station,
+        "ip_route": ip_route, "ip6_route": ip6_route,
+        "dns_conf": dns_conf, "resolvectl": resolvectl, "lspci": lspci,
+        "proc_wireless": proc_wireless, "nm_logs": nm_logs,
+        "conn_active": conn_active, "nets": nets,
+        "ping_gw_txt": ping_gw, "ping_ext_txt": ping_ext, "ping_dns_txt": ping_dns,
+        "ping_gw": parse_ping(ping_gw), "ping_ext": parse_ping(ping_ext),
+        "ping_dns": parse_ping(ping_dns), "gw": gw,
+    }
+
+
+def build_recommendations(data, cur, cur_dbm):
+    recs = []
+    esc = html.escape
+    nets = data["nets"]
+    pg, pe = data["ping_gw"], data["ping_ext"]
+    if cur_dbm is not None:
+        if cur_dbm >= -50:
+            recs.append(("good", f"Signal is excellent ({cur_dbm} dBm). No action needed."))
+        elif cur_dbm >= -65:
+            recs.append(("good", f"Signal is good ({cur_dbm} dBm) — suitable for HD video calls and gaming."))
+        elif cur_dbm >= -72:
+            recs.append(("warn", f"Signal is fair ({cur_dbm} dBm). Move closer to the AP or pick a stronger BSSID of the same SSID."))
+        else:
+            recs.append(("bad", f"Signal is weak ({cur_dbm} dBm). Move closer, switch band, or add a mesh node."))
+    if cur is not None:
+        same_ch = [n for n in nets if n["CHAN"] == cur["CHAN"]]
+        if len(same_ch) >= 4:
+            names = ", ".join(esc(x["SSID_DISP"]) for x in same_ch[:4])
+            recs.append(("warn", f"Channel {esc(cur['CHAN'])} is congested ({len(same_ch)} APs share it, incl. {names}). "
+                                 "If you control the router, try a cleaner 5 GHz channel (44, 52, 100, 149+) with 40/80 MHz width."))
+        elif len(same_ch) >= 2:
+            recs.append(("info", f"Channel {esc(cur['CHAN'])} is shared by {len(same_ch)} APs — normal in apartments. "
+                                 "160 MHz width is fast but picks up more interference; drop to 80 MHz if latency spikes."))
+    groups = collections.Counter(n["SSID"] for n in nets)
+    dupes = [s for s, c in groups.items() if c > 1 and s]
+    if dupes:
+        recs.append(("info", "Multiple BSSIDs broadcast the same SSID (%s) — a mesh / multi-AP setup. "
+                             "The client roams to the best BSSID automatically."
+                     % ", ".join(esc(s) if s else "(hidden)" for s in dupes[:5])))
+    weak = [n for n in nets if "WPA1" in (n["SECURITY"] or "") or "WEP" in (n["SECURITY"] or "")]
+    if weak:
+        recs.append(("warn", f"{len(weak)} nearby network(s) still use WPA1/TKIP or WEP "
+                             f"({', '.join(esc(n['SSID_DISP']) for n in weak[:4])}). Avoid joining them; "
+                             f"TKIP is broken and slows the 2.4 GHz band. Current: {esc(cur['SECURITY']) if cur else '?'}."))
+    if cur is not None and "2.4" in (cur.get("BAND") or ""):
+        recs.append(("info", "You're on 2.4 GHz (longer range, slower, crowded). For speed, prefer the _5G / _5GHz 5 GHz BSSID in the same room."))
+    elif cur is not None and cur.get("BAND") == "5 GHz":
+        recs.append(("good", "You're on 5 GHz with wide channel and HE (Wi-Fi 6) rates — best for throughput in the same room."))
+    if pg.get("loss") not in ("0%",):
+        recs.append(("bad", f"Packet loss to gateway ({esc(pg.get('loss', '?'))}) — check AP load or backhaul."))
+    else:
+        try:
+            avg = float(pg.get("avg", "0") or 0)
+        except ValueError:
+            avg = 0
+        if avg > 20:
+            recs.append(("warn", f"Gateway latency is high (avg {esc(pg['avg'])} ms). Try a closer AP or 5 GHz."))
+        else:
+            recs.append(("good", f"Gateway latency healthy (avg {esc(pg['avg'])} ms, 0% loss); internet {esc(pe['avg'])} ms to 8.8.8.8."))
+    hidden = [n for n in nets if not n["SSID"]]
+    if hidden:
+        recs.append(("info", f"{len(hidden)} hidden-SSID AP(s) detected (e.g. {esc(hidden[0]['BSSID'])} on ch {esc(hidden[0]['CHAN'])}). They still use airtime."))
+    if data["dev_kv"].get("IP4.ADDRESS[1]", "").startswith("169.254."):
+        recs.append(("bad", "APIPA address (169.254.x.x) — DHCP failed. Restart AP / renew lease."))
+    return recs
+
+
+# ------------------------------------------------------------ HTML report
+
+def render_html(data, log_minutes=60):
+    esc = html.escape
+    nets = data["nets"]
+    dev_kv = data["dev_kv"]
+    iface = data["iface"]
+    iw_link = data["iw_link"]
+    now_local = datetime.datetime.now().astimezone()
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    hostname = socket.gethostname()
+
+    cur = next((n for n in nets if n.get("IN-USE") == "*"), None)
+    m_ssid = re.search(r"SSID:\s*(.+)", iw_link)
+    m_sig = re.search(r"signal:\s*(-?\d+)\s*dBm", iw_link)
+    m_freq = re.search(r"freq:\s*([\d.]+)", iw_link)
+    m_rx = re.search(r"rx bitrate:\s*([^\n]+)", iw_link)
+    m_tx = re.search(r"tx bitrate:\s*([^\n]+)", iw_link)
+    m_bss = re.search(r"Connected to\s*([0-9a-f:]+)", iw_link)
+    cur_dbm = int(m_sig.group(1)) if m_sig else (signal_to_dbm(cur["SIGNAL_INT"]) if cur else None)
+
+    chan_counts = collections.Counter(n["CHAN"] for n in nets if n["CHAN"])
+    band_counts = collections.Counter(n["BAND"] or "Unknown" for n in nets)
+    sec_counts = collections.Counter(sec_label(n["SECURITY"]) for n in nets)
+    recs = build_recommendations(data, cur, cur_dbm)
+    pg, pe, pd = data["ping_gw"], data["ping_ext"], data["ping_dns"]
+    max_chan = max(chan_counts.values()) if chan_counts else 1
+    try:
+        local_ip = dev_kv.get("IP4.ADDRESS[1]", "-").split("/")[0]
+    except Exception:  # noqa: BLE001
+        local_ip = "-"
+    cur_ssid = esc(m_ssid.group(1).strip() if m_ssid else (cur["SSID"] if cur else "-"))
+    cur_bssid = esc(m_bss.group(1) if m_bss else (cur["BSSID"] if cur else "-"))
+    radio_out, _ = run(["nmcli", "radio", "wifi"])
+    radio = radio_out.splitlines()[0] if radio_out else ""
+    lspci_line = next((l.strip() for l in data["lspci"].splitlines()
+                       if "Network" in l or "Wireless" in l or "WiFi" in l), "-")
+    band_summary = ", ".join(f"{k}: {v}" for k, v in band_counts.items())
+
+    rows = []
+    for n in nets:
+        sig = n["SIGNAL_INT"]
+        cls = "cur" if n.get("IN-USE") == "*" else ""
+        bar_w = max(0, min(100, sig))
+        color = "#16a34a" if sig >= 65 else ("#ca8a04" if sig >= 45 else ("#ea580c" if sig >= 25 else "#dc2626"))
+        dbm = signal_to_dbm(sig)
+        star = "★" if n.get("IN-USE") == "*" else ""
+        rows.append(
+            f'<tr class="{cls}"><td>{star}</td>'
+            f'<td><strong>{esc(n["SSID_DISP"])}</strong><div class="muted mono">{esc(n["BSSID"])}</div></td>'
+            f'<td class="mono">{esc(n["CHAN"])}</td>'
+            f'<td class="mono">{esc(n["FREQ"])}<div class="muted">{esc(n["BAND"])} · {esc(n["BANDWIDTH"])}</div></td>'
+            f'<td><div class="sig"><div class="sigfill" style="width:{bar_w}%;background:{color}"></div></div>'
+            f'<span class="mono">{sig}% · ~{dbm} dBm</span><div class="muted">{quality_label(sig)}</div></td>'
+            f'<td class="mono">{esc(n["RATE"])}</td>'
+            f'<td>{esc(sec_label(n["SECURITY"]))}<div class="muted mono">{esc(n["SECURITY"])}</div></td>'
+            f'<td class="muted">{esc(n["MODE"])}</td></tr>')
+    rows_html = "".join(rows)
+    chan_bars_html = "".join(
+        f'<div class="hrow"><span class="mono ch">ch {esc(ch)}</span>'
+        f'<div class="hbar"><div class="hfill" style="width:{c / max_chan * 100:.0f}%"></div></div>'
+        f'<span class="mono">{c} AP(s)</span></div>'
+        for ch, c in sorted(chan_counts.items(),
+                            key=lambda x: (int(x[0]) if str(x[0]).isdigit() else 9999)))
+    sig_bars_html = "".join(
+        f'<div class="hrow"><span class="ssid">{esc(n["SSID_DISP"])} '
+        f'<span class="muted mono">{esc(n["BSSID"][-5:])} ch{esc(n["CHAN"])}</span></span>'
+        f'<div class="hbar"><div class="hfill sigfill2" style="width:{max(0, min(100, n["SIGNAL_INT"]))}%"></div></div>'
+        f'<span class="mono">{n["SIGNAL_INT"]}%</span></div>'
+        for n in nets[:12])
+    sec_rows_html = "".join(f"<tr><td>{esc(k)}</td><td class='mono'>{v}</td></tr>" for k, v in sec_counts.most_common())
+    band_rows_html = "".join(f"<tr><td>{esc(k)}</td><td class='mono'>{v}</td></tr>" for k, v in band_counts.most_common())
+    rec_html = "".join(f"<li class='{lvl}'><span class='badge'>{lvl.upper()}</span> {msg}</li>" for lvl, msg in recs)
+    log_lines = data["nm_logs"].splitlines()[-80:]
+    log_html = "\n".join(esc(line) for line in log_lines) if log_lines else "(no logs)"
+    sig_pct = cur["SIGNAL_INT"] if cur else "?"
+    sig_qual = quality_label(cur["SIGNAL_INT"]) if cur else ""
+    rx_rate = m_rx.group(1).strip() if m_rx else (cur["RATE"] if cur else "-")
+    tx_rate = m_tx.group(1).strip() if m_tx else ""
+    freq_line = (m_freq.group(1) + " MHz") if m_freq else (cur["FREQ"] if cur else "-")
+    cur_chan = cur["CHAN"] if cur else "?"
+    cur_bandline = (cur["FREQ"] + " · " + cur["BAND"] + " · " + cur["BANDWIDTH"]) if cur else ""
+    cur_sec = sec_label(cur["SECURITY"]) if cur else "-"
+    cur_sec_raw = cur["SECURITY"] if cur else ""
+    gen_state = dev_kv.get("GENERAL.STATE", "")
+    product = dev_kv.get("GENERAL.PRODUCT", "Intel WiFi")
+    driver = dev_kv.get("GENERAL.DRIVER", "")
+    fw = dev_kv.get("GENERAL.FIRMWARE-VERSION", "")
+
+    chat_entries = data.get("chat", []) or []
+    if chat_entries:
+        bubbles = []
+        for e in chat_entries[-60:]:
+            who = e.get("role", "wlan")
+            mine = " me" if who == "you" else ""
+            bubbles.append(
+                f'<div class="bubble{mine}"><span class="who">{esc(who)} · {esc(e.get("t", ""))}</span>'
+                f'{esc(e.get("text", ""))}</div>')
+        chat_html = "".join(bubbles)
+    else:
+        chat_html = ('<div class="muted">No session log recorded — generate with '
+                     '<code>wlan-report report</code> to see the progress + interaction here.</div>')
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wi-Fi Diagnostic Report — {esc(hostname)}</title>
+<style>
+:root{{--bg:#0f172a;--card:#ffffff;--muted:#64748b;--line:#e2e8f0;--accent:#2563eb}}
+*{{box-sizing:border-box}}body{{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;background:#f1f5f9;color:#0f172a}}
+header{{background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;padding:28px 24px}}
+header h1{{margin:0 0 6px;font-size:24px}}header p{{margin:2px 0;opacity:.9}}
+.wrap{{max-width:1100px;margin:-18px auto 40px;padding:0 16px}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin:14px 0;box-shadow:0 2px 10px rgba(15,23,42,.05)}}
+.card h2{{margin:0 0 12px;font-size:18px;border-bottom:2px solid var(--line);padding-bottom:8px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}}
+.kpi{{background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:12px}}
+.kpi .v{{font-size:20px;font-weight:700}}.kpi .l{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}}
+table{{width:100%;border-collapse:collapse;font-size:14px}}th,td{{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}}
+th{{background:#f8fafc;position:sticky;top:0}}tr.cur{{background:#eff6ff}}
+.muted{{color:var(--muted);font-size:12px}}.mono{{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}}
+.sig{{height:8px;background:#e2e8f0;border-radius:99px;overflow:hidden;min-width:110px}}.sigfill{{height:100%}}
+.hrow{{display:flex;align-items:center;gap:10px;margin:6px 0}}.hbar{{flex:1;height:12px;background:#e2e8f0;border-radius:99px;overflow:hidden}}.hfill{{height:100%;background:var(--accent)}}.sigfill2{{background:linear-gradient(90deg,#22c55e,#eab308,#ef4444)}}
+.ch{{min-width:52px}}.ssid{{min-width:220px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+pre{{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:10px;overflow:auto;font-size:12px;max-height:380px}}
+.badge{{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;background:#e2e8f0;margin-right:6px}}
+li.good .badge{{background:#dcfce7;color:#166534}}li.warn .badge{{background:#fef9c3;color:#854d0e}}li.bad .badge{{background:#fee2e2;color:#991b1b}}li.info .badge{{background:#dbeafe;color:#1e40af}}
+ul.recs{{list-style:none;padding:0}}ul.recs li{{padding:10px;border:1px solid var(--line);border-radius:10px;margin:8px 0;background:#f8fafc}}
+.toolbar{{display:flex;gap:8px;margin-bottom:10px}}input[type=search]{{flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:8px}}
+.chatlog{{display:flex;flex-direction:column;gap:8px;max-height:340px;overflow:auto;background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:12px}}
+.bubble{{max-width:85%;background:#fff;border:1px solid var(--line);border-radius:4px 14px 14px 14px;padding:8px 12px;font-size:13px;white-space:pre-wrap;word-break:break-word}}
+.bubble.me{{align-self:flex-end;background:#eff6ff;border-color:#bfdbfe;border-radius:14px 4px 14px 14px}}
+.bubble .who{{display:block;font-size:11px;color:var(--muted);margin-bottom:2px}}
+.chatbox{{display:flex;gap:8px;margin-top:10px}}.chatbox input{{flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:8px}}.chatbox button{{padding:8px 14px;border:0;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}}
+footer{{color:var(--muted);font-size:12px;text-align:center;margin:20px}}
+@media print{{header{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}.wrap{{margin:0;max-width:none}}}}
+</style></head><body>
+<header><h1>📶 Wi-Fi Diagnostic Report</h1>
+<p>Host <strong>{esc(hostname)}</strong> · Interface <strong>{esc(iface)}</strong> · Generated {esc(now_local.strftime("%Y-%m-%d %H:%M:%S %Z"))} ({esc(now_utc.strftime("%Y-%m-%d %H:%M UTC"))})</p>
+<p>Connected to <strong>{cur_ssid}</strong> ({cur_bssid}) · {len(nets)} networks found · Linux equivalent of <code>netsh wlan show networks</code> + <code>netsh wlanreport</code></p></header>
+<div class="wrap">
+<div class="card"><h2>Summary</h2><div class="grid">
+<div class="kpi"><div class="l">Status</div><div class="v">✅ Connected</div><div class="muted">{cur_ssid} · {esc(gen_state)}</div></div>
+<div class="kpi"><div class="l">Signal</div><div class="v">{cur_dbm if cur_dbm is not None else "?"} dBm</div><div class="muted">{sig_pct}% · {sig_qual}</div></div>
+<div class="kpi"><div class="l">Link speed</div><div class="v mono" style="font-size:15px">{esc(rx_rate)}</div><div class="muted">RX · TX {esc(tx_rate)}</div></div>
+<div class="kpi"><div class="l">Channel / Band</div><div class="v mono">ch {esc(cur_chan)}</div><div class="muted">{esc(cur_bandline)}</div></div>
+<div class="kpi"><div class="l">Local IP / Gateway</div><div class="v mono" style="font-size:15px">{esc(local_ip)}</div><div class="muted mono">gw {esc(dev_kv.get("IP4.GATEWAY", "-"))} · ping {esc(pg["avg"])} ms</div></div>
+<div class="kpi"><div class="l">Internet</div><div class="v">8.8.8.8 {esc(pe["avg"])} ms</div><div class="muted">loss {esc(pe["loss"])} · DNS google.com {esc(pd["avg"])} ms</div></div>
+<div class="kpi"><div class="l">Networks nearby</div><div class="v">{len(nets)}</div><div class="muted">{esc(band_summary)}</div></div>
+<div class="kpi"><div class="l">Adapter</div><div class="v" style="font-size:14px">{esc(product)}</div><div class="muted mono">{esc(driver)} · {esc(fw)}</div></div>
+</div></div>
+<div class="card"><h2>Recommendations</h2><ul class="recs">{rec_html}</ul></div>
+<div class="card"><h2>Session chat log — progress &amp; interaction</h2>
+<div class="chatlog" id="chatlog">{chat_html}</div>
+<div class="chatbox"><input id="chatinput" placeholder="Type a note here and press Enter — kept in this browser…"><button id="chatsend">Send</button></div>
+<p class="muted">Live transcript of this diagnostic run. Notes you type above are stored locally in your browser (localStorage) and never leave your machine.</p></div>
+<div class="card"><h2>Adapter &amp; System</h2>
+<table><tr><th style="width:260px">Item</th><th>Value</th></tr>
+<tr><td>Adapter</td><td>{esc(dev_kv.get("GENERAL.PRODUCT", "-"))} — {esc(dev_kv.get("GENERAL.VENDOR", ""))} <span class="muted">({esc(dev_kv.get("GENERAL.PATH", ""))})</span></td></tr>
+<tr><td>Driver / Firmware</td><td class="mono">{esc(dev_kv.get("GENERAL.DRIVER", "-"))} · kernel {esc(dev_kv.get("GENERAL.DRIVER-VERSION", "-"))} · fw {esc(dev_kv.get("GENERAL.FIRMWARE-VERSION", "-"))}</td></tr>
+<tr><td>MAC</td><td class="mono">{esc(dev_kv.get("GENERAL.HWADDR", "-"))}</td></tr>
+<tr><td>MTU / State</td><td class="mono">{esc(dev_kv.get("GENERAL.MTU", "-"))} · {esc(dev_kv.get("GENERAL.STATE", "-"))}</td></tr>
+<tr><td>lspci</td><td class="mono">{esc(lspci_line)}</td></tr>
+<tr><td>Radio</td><td class="mono">{esc(radio)} · {esc(data["dev_status"].splitlines()[0] if data["dev_status"] else "")}</td></tr>
+<tr><td>/proc/net/wireless</td><td class="mono">{esc(data["proc_wireless"].replace(chr(10), " | "))}</td></tr>
+</table></div>
+<div class="card"><h2>Current connection — {cur_ssid}</h2>
+<table><tr><th style="width:260px">Item</th><th>Value</th></tr>
+<tr><td>SSID / BSSID</td><td><strong>{cur_ssid}</strong> <span class="mono muted">{cur_bssid}</span></td></tr>
+<tr><td>Frequency / Channel</td><td class="mono">{esc(freq_line)} · ch {esc(cur_chan)} · {esc(cur_bandline)}</td></tr>
+<tr><td>Security</td><td>{esc(cur_sec)} <span class="muted mono">{esc(cur_sec_raw)}</span></td></tr>
+<tr><td>Signal</td><td class="mono">{cur_dbm} dBm · {sig_pct}% · {sig_qual}</td></tr>
+<tr><td>Bitrates</td><td class="mono">RX {esc(rx_rate)} <br>TX {esc(tx_rate)}</td></tr>
+<tr><td>IPv4</td><td class="mono">{esc(dev_kv.get("IP4.ADDRESS[1]", "-"))} · gw {esc(dev_kv.get("IP4.GATEWAY", "-"))} · dns {esc(dev_kv.get("IP4.DNS[1]", "-"))}</td></tr>
+<tr><td>IPv6</td><td class="mono">{esc(dev_kv.get("IP6.ADDRESS[1]", "-"))} · gw {esc(dev_kv.get("IP6.GATEWAY", "-"))}</td></tr>
+<tr><td>Routes</td><td class="mono">{esc(data["ip_route"])}<br>{esc(data["ip6_route"])}</td></tr>
+</table>
+<h3 style="margin:14px 0 6px">iw link</h3><pre>{esc(iw_link)}</pre>
+<h3 style="margin:14px 0 6px">iw station dump</h3><pre>{esc(data["iw_station"])}</pre>
+</div>
+<div class="card"><h2>All nearby networks ({len(nets)})</h2>
+<div class="toolbar"><input type="search" id="q" placeholder="Filter by SSID / BSSID / channel / security…"></div>
+<table id="nets"><thead><tr><th></th><th>Network (SSID / BSSID)</th><th>Ch</th><th>Freq / Band</th><th>Signal</th><th>Max rate</th><th>Security</th><th>Mode</th></tr></thead>
+<tbody>{rows_html}</tbody></table>
+<p class="muted">★ = current connection. Signal % is from NetworkManager; dBm ≈ %/2 − 100 except the live <code>iw</code> reading ({cur_dbm} dBm). Sorted by signal.</p></div>
+<div class="card"><h2>Channel utilization</h2>{chan_bars_html}
+<h2 style="margin-top:16px">Signal ranking (top 12)</h2>{sig_bars_html}</div>
+<div class="card"><h2>Band &amp; security breakdown</h2><div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+<div><h3>Bands</h3><table>{band_rows_html}</table></div>
+<div><h3>Security</h3><table>{sec_rows_html}</table></div></div>
+<p class="muted">WPA1/TKIP and WEP are deprecated. WPA2 (CCMP) is the baseline; WPA2/WPA3-transitional or WPA3-SAE preferred.</p></div>
+<div class="card"><h2>Connectivity diagnostics</h2>
+<table><tr><th>Target</th><th>Loss</th><th>min</th><th>avg</th><th>max</th><th>mdev</th></tr>
+<tr><td class="mono">gateway {esc(data["gw"])}</td><td class="mono">{esc(pg["loss"])}</td><td class="mono">{esc(pg["min"])} ms</td><td class="mono"><strong>{esc(pg["avg"])} ms</strong></td><td class="mono">{esc(pg["max"])} ms</td><td class="mono">{esc(pg["mdev"])} ms</td></tr>
+<tr><td class="mono">8.8.8.8 (internet)</td><td class="mono">{esc(pe["loss"])}</td><td class="mono">{esc(pe["min"])} ms</td><td class="mono"><strong>{esc(pe["avg"])} ms</strong></td><td class="mono">{esc(pe["max"])} ms</td><td class="mono">{esc(pe["mdev"])} ms</td></tr>
+<tr><td class="mono">google.com (DNS+inet)</td><td class="mono">{esc(pd["loss"])}</td><td class="mono">{esc(pd["min"])} ms</td><td class="mono"><strong>{esc(pd["avg"])} ms</strong></td><td class="mono">{esc(pd["max"])} ms</td><td class="mono">{esc(pd["mdev"])} ms</td></tr></table>
+<h3>DNS</h3><pre>{esc(data["resolvectl"] or data["dns_conf"])}</pre>
+<h3>Active connections</h3><pre>{esc(data["conn_active"])}</pre>
+</div>
+<div class="card"><h2>Event log — NetworkManager (last {log_minutes} min)</h2><pre>{log_html}</pre></div>
+<div class="card"><h2>How this was collected (Linux ≈ netsh wlanreport)</h2>
+<pre>nmcli device wifi rescan && nmcli -t -f IN-USE,SSID,BSSID,MODE,CHAN,FREQ,RATE,SIGNAL,BARS,SECURITY device wifi list --rescan yes
+nmcli -f GENERAL,IP4,IP6,DHCP4 device show {esc(iface)}
+iw dev {esc(iface)} link; iw dev {esc(iface)} station dump
+ip route show; resolvectl status {esc(iface)}
+ping -c 5 &lt;gateway&gt;; ping -c 5 8.8.8.8; ping -c 5 google.com
+journalctl -u NetworkManager --since "{log_minutes} min ago"</pre>
+<p class="muted">Windows: <code>netsh wlan show networks mode=bssid</code> then <code>netsh wlanreport</code>.</p></div>
+</div>
+<footer>Generated by wlan-report v{VERSION} · {esc(now_local.isoformat())} · open this file in any browser (file://) — no server needed.</footer>
+<script>
+var q=document.getElementById('q');
+q.addEventListener('input',function(){{var s=q.value.toLowerCase();document.querySelectorAll('#nets tbody tr').forEach(function(tr){{tr.style.display=tr.innerText.toLowerCase().includes(s)?'':'none'}})}});
+var chatlog=document.getElementById('chatlog'),chatinput=document.getElementById('chatinput'),chatsend=document.getElementById('chatsend');
+function addNote(t,save){{var d=document.createElement('div');d.className='bubble me';var w=document.createElement('span');w.className='who';w.textContent='you · note';d.appendChild(w);d.appendChild(document.createTextNode(t));chatlog.appendChild(d);chatlog.scrollTop=chatlog.scrollHeight;if(save!==false){{try{{var k='wlan-report-notes';var a=JSON.parse(localStorage.getItem(k)||'[]');a.push(t);localStorage.setItem(k,JSON.stringify(a))}}catch(e){{}}}}}}
+chatsend.addEventListener('click',function(){{if(chatinput.value.trim()){{addNote(chatinput.value.trim());chatinput.value=''}}}});
+chatinput.addEventListener('keydown',function(e){{if(e.key==='Enter'&&chatinput.value.trim()){{addNote(chatinput.value.trim());chatinput.value=''}}}});
+try{{(JSON.parse(localStorage.getItem('wlan-report-notes')||'[]')).forEach(function(t){{addNote(t,false)}})}}catch(e){{}}
+</script>
+</body></html>"""
+
+
+# ------------------------------------------------------------ terminal UI
+
+def print_scan_table(nets, limit=0, sort="signal"):
+    if sort == "channel":
+        nets = sorted(nets, key=lambda n: (n.get("CHAN_INT", 999) if isinstance(n.get("CHAN_INT"), int) else 9999, -n["SIGNAL_INT"]))
+    elif sort == "ssid":
+        nets = sorted(nets, key=lambda n: ((n["SSID"] or "\uffff").lower(), -n["SIGNAL_INT"]))
+    else:
+        nets = sorted(nets, key=lambda n: n["SIGNAL_INT"], reverse=True)
+    if limit and limit > 0:
+        nets = nets[:limit]
+    hdr = f'{"*":1} {"SSID":28} {"BSSID":17} {"CH":>3} {"FREQ":>10} {"SIG":>4}  SECURITY'
+    print(hdr)
+    print("-" * len(hdr))
+    for n in nets:
+        star = "*" if n.get("IN-USE") == "*" else " "
+        ssid = (n["SSID_DISP"] or "")[:28]
+        print(f"{star} {ssid:28} {n['BSSID']:17} {n['CHAN']:>3} {n['FREQ']:>10} {n['SIGNAL_INT']:>3}%  {n['SECURITY']}")
+    print(f"\n{len(nets)} network(s) shown.")
+
+
+def print_info(data):
+    dev_kv = data["dev_kv"]
+    nets = data["nets"]
+    cur = next((n for n in nets if n.get("IN-USE") == "*"), None)
+    m = re.search(r"signal:\s*(-?\d+)\s*dBm", data["iw_link"])
+    dbm = m.group(1) + " dBm" if m else "?"
+    print(f"Interface : {data['iface']}")
+    print(f"Adapter   : {dev_kv.get('GENERAL.PRODUCT', '-')} ({dev_kv.get('GENERAL.DRIVER', '-')})")
+    print(f"Connected : {cur['SSID'] + ' / ' + cur['BSSID'] if cur else '(disconnected)'}")
+    print(f"Signal    : {dbm} ({cur['SIGNAL_INT']}% {quality_label(cur['SIGNAL_INT'])})" if cur else "Signal    : -")
+    print(f"Channel   : {cur['CHAN'] + ' / ' + cur['FREQ'] + ' / ' + cur['BAND'] if cur else '-'}")
+    print(f"Security  : {sec_label(cur['SECURITY']) if cur else '-'}")
+    print(f"IPv4      : {dev_kv.get('IP4.ADDRESS[1]', '-')}  gw {dev_kv.get('IP4.GATEWAY', '-')}")
+    print(f"Ping gw   : {data['ping_gw']['avg']} ms (loss {data['ping_gw']['loss']})")
+    print(f"Ping inet : {data['ping_ext']['avg']} ms to 8.8.8.8 (loss {data['ping_ext']['loss']})")
+    print(f"Nearby    : {len(nets)} network(s)")
+
+
+def open_in_browser(path_or_url):
+    try:
+        return webbrowser.open(path_or_url)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def serve_file(path, bind="127.0.0.1", port=8000, open_browser=False):
+    path = pathlib.Path(path).resolve()
+    if not path.exists():
+        print(f"error: file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(path.parent))
+    srv = http.server.ThreadingHTTPServer((bind, port), handler)
+    url = f"http://{bind}:{srv.server_port}/{path.name}"
+    print(f"Serving {path.parent} at http://{bind}:{srv.server_port}/")
+    print(f"Report URL: {url}")
+    if open_browser:
+        threading.Timer(0.5, lambda: open_in_browser(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        srv.server_close()
+
+
+# ------------------------------------------------------------------ CLI
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="wlan-report",
+                                description="Linux netsh wlanreport equivalent: scan Wi-Fi around you and build a browser-openable HTML report.")
+    p.add_argument("--iface", default=None, help="Wi-Fi interface (default: auto-detect)")
+    p.add_argument("--no-banner", action="store_true", help="skip the ASCII art banner")
+    p.add_argument("--no-color", action="store_true", help="disable ANSI colors")
+    p.add_argument("-V", "--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("scan", help="list nearby Wi-Fi networks in the terminal (like `netsh wlan show networks`)")
+    s.add_argument("--iface", default=None)
+    s.add_argument("--no-banner", action="store_true")
+    s.add_argument("--no-color", action="store_true")
+    s.add_argument("--no-rescan", action="store_true", help="skip fresh rescan, use cached results (faster)")
+    s.add_argument("--json", action="store_true", help="output JSON instead of table")
+    s.add_argument("--limit", type=int, default=0, help="show only top N networks")
+    s.add_argument("--sort", choices=["signal", "channel", "ssid"], default="signal")
+
+    i = sub.add_parser("info", help="show current connection summary in the terminal")
+    i.add_argument("--iface", default=None)
+    i.add_argument("--no-banner", action="store_true")
+    i.add_argument("--no-color", action="store_true")
+    i.add_argument("--no-rescan", action="store_true")
+    i.add_argument("--no-ping", action="store_true", help="skip ping tests (faster/offline)")
+    i.add_argument("--json", action="store_true")
+
+    c = sub.add_parser("chat", help="interactive chatbox mode: talk to the diagnostic assistant")
+    c.add_argument("--iface", default=None)
+    c.add_argument("--no-banner", action="store_true")
+    c.add_argument("--no-color", action="store_true")
+
+    r = sub.add_parser("report", help="generate the HTML report (like `netsh wlanreport`)")
+    r.add_argument("--iface", default=None)
+    r.add_argument("--no-banner", action="store_true")
+    r.add_argument("--no-color", action="store_true")
+    r.add_argument("-o", "--output", default=DEFAULT_OUT, help=f"output HTML path (default: {DEFAULT_OUT})")
+    r.add_argument("--json-out", default=None, help="also write raw JSON here (default: <output>-data.json)")
+    r.add_argument("--no-json", action="store_true", help="don't write the sidecar JSON file")
+    r.add_argument("--chat-log", default=None, help="write chat transcript here (default: <output>-chat.log)")
+    r.add_argument("--no-chat-log", action="store_true", help="don't write the chat transcript file")
+    r.add_argument("--no-rescan", action="store_true")
+    r.add_argument("--no-ping", action="store_true")
+    r.add_argument("--log-minutes", type=int, default=60, help="how much journal history to embed (default: 60)")
+    r.add_argument("--open", action="store_true", help="open the report in a browser after generating")
+    r.add_argument("--serve", action="store_true", help="serve the report over HTTP after generating")
+    r.add_argument("--bind", default="127.0.0.1")
+    r.add_argument("--port", type=int, default=8000)
+
+    v = sub.add_parser("serve", help="serve an existing report over HTTP and optionally open it")
+    v.add_argument("file", nargs="?", default=DEFAULT_OUT, help="HTML file to serve")
+    v.add_argument("--bind", default="127.0.0.1")
+    v.add_argument("--port", type=int, default=8000)
+    v.add_argument("--open", action="store_true", help="open browser to the served URL")
+    return p
+
+
+def cmd_chat(iface, use_color=True, banner=True):
+    """Interactive chatbox loop: `you>` prompt, wlan-bot answers + runs scans."""
+    chat = ChatLog(use_color=use_color)
+    if banner:
+        show_banner(use_color=use_color)
+    chat.box("wlan-report chat",
+             "commands: scan | info | report [-o file] | open | serve [port] | log | clear | help | exit")
+    chat.say("wlan", f"hey! watching {iface} for you. what should we diagnose?")
+    last_report = DEFAULT_OUT
+    HELP = ("scan .......... list nearby networks\n"
+            "info .......... current connection summary\n"
+            "report ........ generate HTML report (report -o /tmp/x.html)\n"
+            "open .......... open last report in browser\n"
+            "serve [port] .. serve last report over HTTP\n"
+            "log ........... show this chat transcript\n"
+            "clear ......... clear the screen\n"
+            "help .......... this help\n"
+            "exit .......... leave (transcript is saved)")
+    while True:
+        try:
+            line = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            chat.say("wlan", "bye! transcript saved.")
+            break
+        if not line:
+            continue
+        chat.say("you", line)
+        parts = line.split()
+        cmd, rest = parts[0].lower(), parts[1:]
+        if cmd in ("exit", "quit", "q", "bye"):
+            chat.say("wlan", "bye! happy surfing.")
+            break
+        elif cmd == "help":
+            print(HELP)
+            chat.say("wlan", "here is what I understand ^")
+        elif cmd == "clear":
+            run(["clear"])
+            show_banner(use_color=use_color)
+        elif cmd == "log":
+            for e in chat.entries:
+                print(f"[{e['t']}] {e['role']:>4} | {e['text']}")
+        elif cmd == "scan":
+            chat.say("wlan", "on it — scanning the airwaves…")
+            nets = get_wifi_networks(iface, rescan=True, log=chat)
+            print_scan_table(nets)
+            chat.say("wlan", f"done — {len(nets)} network(s). say 'report' for the full HTML page.")
+        elif cmd == "info":
+            chat.say("wlan", "checking your link…")
+            data = collect_all(iface, rescan=False, do_ping=True, log=chat)
+            print_info(data)
+            chat.say("wlan", "that is your current link. 'scan' shows the neighbors.")
+        elif cmd == "report":
+            out = DEFAULT_OUT
+            if rest:
+                if rest[0] in ("-o", "--output") and len(rest) > 1:
+                    out = rest[1]
+                elif not rest[0].startswith("-"):
+                    out = rest[0]
+            chat.say("wlan", f"building the full HTML report → {out} …")
+            data = collect_all(iface, rescan=True, do_ping=True, log=chat)
+            data["chat"] = list(chat.entries)
+            html_doc = render_html(data)
+            op = pathlib.Path(out)
+            op.parent.mkdir(parents=True, exist_ok=True)
+            op.write_text(html_doc, encoding="utf-8")
+            last_report = str(op)
+            chat.box("report ready", f"{op}\n{len(data['nets'])} networks — open it in a browser!")
+        elif cmd == "open":
+            uri = pathlib.Path(last_report).resolve().as_uri()
+            chat.say("wlan", f"opening {uri}")
+            if not open_in_browser(uri):
+                chat.say("wlan", f"could not auto-open — paste this in a browser: {uri}")
+        elif cmd == "serve":
+            port = int(rest[0]) if rest and rest[0].isdigit() else 8000
+            chat.say("wlan", f"serving {last_report} on port {port} (Ctrl+C to stop)…")
+            serve_file(last_report, port=port, open_browser=True)
+            chat.say("wlan", "server stopped — back in chat. what next?")
+        else:
+            chat.say("wlan", f"hmm, I don't know '{cmd}'. try: help")
+    try:
+        tp = pathlib.Path.home() / "wlan-report-chat.log"
+        chat.save(str(tp))
+        print(f"chat transcript: {tp}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def main(argv=None):
+    # legacy: `wlan-report out.html` (no subcommand) == `wlan-report report -o out.html`
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] not in ("scan", "info", "chat", "report", "serve", "-h", "--help", "-V", "--version") and not argv[0].startswith("-"):
+        argv = ["report", "-o"] + argv
+    args = build_parser().parse_args(argv)
+    cmd = args.cmd or "report"  # default when only global flags given
+
+    use_color = _color_enabled(getattr(args, "no_color", False))
+    json_mode = bool(getattr(args, "json", False))
+    want_banner = (not getattr(args, "no_banner", False)) and not json_mode
+    chat = ChatLog(use_color=use_color, quiet=json_mode)
+
+    iface = detect_iface(getattr(args, "iface", None))
+
+    if cmd == "chat":
+        cmd_chat(iface, use_color=use_color, banner=want_banner)
+        return
+
+    if want_banner:
+        show_banner(use_color=use_color)
+
+    if cmd == "scan":
+        chat.say("you", f"scan on {iface}")
+        nets = get_wifi_networks(iface, rescan=not args.no_rescan, log=None if json_mode else chat)
+        if args.json:
+            print(json.dumps(nets, indent=2))
+        else:
+            print(f"\nInterface: {iface}  ({len(nets)} networks)\n")
+            print_scan_table(nets, limit=args.limit, sort=args.sort)
+        return
+
+    if cmd == "info":
+        chat.say("you", f"info on {iface}")
+        data = collect_all(iface, rescan=not args.no_rescan, do_ping=not args.no_ping,
+                           log=None if json_mode else chat)
+        if args.json:
+            slim = {"iface": iface, "device": data["dev_kv"], "networks": data["nets"],
+                    "ping_gw": data["ping_gw"], "ping_ext": data["ping_ext"], "ping_dns": data["ping_dns"]}
+            print(json.dumps(slim, indent=2))
+        else:
+            print()
+            print_info(data)
+        return
+
+    if cmd == "serve":
+        serve_file(args.file, bind=args.bind, port=args.port, open_browser=args.open)
+        return
+
+    # report (default)
+    out = getattr(args, "output", DEFAULT_OUT)
+    json_out = getattr(args, "json_out", None)
+    no_json = getattr(args, "no_json", False)
+    chat_log = getattr(args, "chat_log", None)
+    no_chat_log = getattr(args, "no_chat_log", False)
+    do_ping = not getattr(args, "no_ping", False)
+    rescan = not getattr(args, "no_rescan", False)
+    log_minutes = getattr(args, "log_minutes", 60)
+    chat.say("you", f"report on {iface} → {out}")
+    chat.say("wlan", "on it — running the full diagnostic…")
+    data = collect_all(iface, rescan=rescan, do_ping=do_ping, log_minutes=log_minutes, log=chat)
+    chat.step("render", "rendering HTML report")
+    data["chat"] = list(chat.entries)
+    html_doc = render_html(data, log_minutes=log_minutes)
+    chat.done("render", "HTML rendered")
+    out_path = pathlib.Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html_doc, encoding="utf-8")
+    chat.say("ok", f"wrote {out_path} ({len(data['nets'])} networks)")
+    print(f"Wrote {out_path} ({len(data['nets'])} networks)")
+    if not no_json:
+        jp = pathlib.Path(json_out) if json_out else out_path.with_name(out_path.stem + "-data.json")
+        raw = {"generated": datetime.datetime.now().astimezone().isoformat(),
+               "hostname": socket.gethostname(), "iface": iface,
+               "networks": data["nets"], "device": data["dev_kv"],
+               "ping_gw": data["ping_gw"], "ping_ext": data["ping_ext"], "ping_dns": data["ping_dns"],
+               "iw_link": data["iw_link"], "iw_station": data["iw_station"]}
+        jp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        print(f"Wrote {jp}")
+    if not no_chat_log:
+        cp = pathlib.Path(chat_log) if chat_log else out_path.with_name(out_path.stem + "-chat.log")
+        chat.save(str(cp))
+        print(f"Wrote {cp} (chat transcript)")
+    if getattr(args, "open", False) and not getattr(args, "serve", False):
+        uri = out_path.resolve().as_uri()
+        print(f"Opening {uri}")
+        if not open_in_browser(uri):
+            print(f"Open this in a browser: {uri}")
+    if getattr(args, "serve", False):
+        serve_file(str(out_path), bind=args.bind, port=args.port, open_browser=True)
+
+
+if __name__ == "__main__":
+    main()
