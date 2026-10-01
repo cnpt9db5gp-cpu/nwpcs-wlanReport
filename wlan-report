@@ -40,7 +40,7 @@ import threading
 import time
 import webbrowser
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 DEFAULT_OUT = str(pathlib.Path.home() / "wlan-report.html")
 
 # ------------------------------------------------- ASCII art + chat UX
@@ -683,7 +683,7 @@ def render_html(data, log_minutes=60):
         sig = n["SIGNAL_INT"]
         cls = "cur" if n.get("IN-USE") == "*" else ""
         bar_w = max(0, min(100, sig))
-        color = "#16a34a" if sig >= 65 else ("#ca8a04" if sig >= 45 else ("#ea580c" if sig >= 25 else "#dc2626"))
+        color = "#111111" if sig >= 65 else ("#555555" if sig >= 45 else ("#999999" if sig >= 25 else "#bbbbbb"))
         dbm = signal_to_dbm(sig)
         star = "●" if n.get("IN-USE") == "*" else ""
         rows.append(
@@ -733,33 +733,33 @@ def render_html(data, log_minutes=60):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Wi-Fi Diagnostic Report — {esc(hostname)}</title>
 <style>
-:root{{--bg:#04060b;--card:#0b1120;--muted:#8ea0c2;--line:#1e2a45;--accent:#6d9bff;--text:#e8eefb}}
-*{{box-sizing:border-box}}body{{margin:0;font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.45}}
-header{{background:#060b18;color:#fff;padding:18px 22px;border-bottom:1px solid #22345c}}
-header h1{{margin:0 0 4px;font-size:20px;font-weight:600}}header p{{margin:2px 0;opacity:.85;font-size:13px}}
-header code{{color:#9dbcff}}
+:root{{--bg:#000000;--card:#fafafa;--muted:#5c5c5c;--line:#dcdcdc;--accent:#000000;--text:#111111}}
+*{{box-sizing:border-box}}body{{margin:0;font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;background:var(--bg);color:#f5f5f5;font-size:14px;line-height:1.45}}
+header{{background:#000;color:#fff;padding:18px 22px;border-bottom:2px solid #fff}}
+header h1{{margin:0 0 4px;font-size:20px;font-weight:700;letter-spacing:.02em}}header p{{margin:2px 0;opacity:.75;font-size:13px}}
+header code{{color:#fff;background:#1c1c1c;padding:1px 5px;border-radius:4px}}
 .wrap{{max-width:1100px;margin:-12px auto 32px;padding:0 16px}}
-.card{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:10px 0;box-shadow:0 2px 12px rgba(0,0,0,.5)}}
-.card h2{{margin:0 0 10px;font-size:15px;font-weight:600;border-bottom:1px solid var(--line);padding-bottom:6px;color:#f2f6ff}}
-.card h3{{color:#dbe6ff;font-size:13px;margin:10px 0 4px}}
+.card{{background:var(--card);color:var(--text);border:1px solid #fff;border-radius:10px;padding:14px 16px;margin:10px 0}}
+.card h2{{margin:0 0 10px;font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border-bottom:2px solid #111;padding-bottom:6px;color:#000}}
+.card h3{{color:#111;font-size:13px;margin:10px 0 4px}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}}
-.kpi{{background:#0e1628;border:1px solid var(--line);border-radius:8px;padding:10px 12px}}
-.kpi .v{{font-size:18px;font-weight:600;color:#fff}}.kpi .l{{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}}
-.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;background:#4ade80;margin-right:6px}}
-table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}}
-th{{background:#0e1628;position:sticky;top:0;color:#cdd9f2;font-weight:600;font-size:12px}}tr.cur{{background:#122441}}
+.kpi{{background:#efefef;border:1px solid #d4d4d4;border-radius:8px;padding:10px 12px}}
+.kpi .v{{font-size:18px;font-weight:700;color:#000}}.kpi .l{{color:#555;font-size:11px;text-transform:uppercase;letter-spacing:.06em}}
+.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;background:#000;margin-right:6px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid #d4d4d4;vertical-align:top}}
+th{{background:#111;position:sticky;top:0;color:#fff;font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.04em}}tr.cur{{background:#e4e4e4}}
 .muted{{color:var(--muted);font-size:12px}}.mono{{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}}
-code{{color:#9dbcff}}
-#nets td:first-child{{color:var(--accent);font-size:11px}}
-.sig{{height:6px;background:#1a2540;border-radius:99px;overflow:hidden;min-width:100px}}.sigfill{{height:100%}}
-.hrow{{display:flex;align-items:center;gap:8px;margin:5px 0}}.hbar{{flex:1;height:10px;background:#1a2540;border-radius:99px;overflow:hidden}}.hfill{{height:100%;background:var(--accent)}}.sigfill2{{background:linear-gradient(90deg,#22c55e,#eab308,#ef4444)}}
+code{{color:#111;background:#e8e8e8;padding:1px 5px;border-radius:4px}}
+#nets td:first-child{{color:#000;font-size:11px}}
+.sig{{height:6px;background:#d4d4d4;border-radius:99px;overflow:hidden;min-width:100px}}.sigfill{{height:100%}}
+.hrow{{display:flex;align-items:center;gap:8px;margin:5px 0}}.hbar{{flex:1;height:10px;background:#d4d4d4;border-radius:99px;overflow:hidden}}.hfill{{height:100%;background:#000}}.sigfill2{{background:linear-gradient(90deg,#000,#666,#ccc)}}
 .ch{{min-width:52px}}.ssid{{min-width:220px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-pre{{background:#020409;color:#d7e3fa;padding:10px 12px;border-radius:8px;overflow:auto;font-size:12px;max-height:340px;border:1px solid var(--line)}}
-.badge{{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;background:#1a2540;color:#9db1d8;margin-right:6px}}
-li.good .badge{{background:#052e1b;color:#4ade80}}li.warn .badge{{background:#3a2a04;color:#facc15}}li.bad .badge{{background:#3f0d0d;color:#f87171}}li.info .badge{{background:#0b2447;color:#7db4ff}}
-ul.recs{{list-style:none;padding:0;margin:0}}ul.recs li{{padding:8px 10px;border:1px solid var(--line);border-radius:8px;margin:6px 0;background:#0e1628}}
-.toolbar{{display:flex;gap:8px;margin-bottom:8px}}input[type=search]{{flex:1;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:#0e1628;color:var(--text)}}
-footer{{color:var(--muted);font-size:12px;text-align:center;margin:14px}}
+pre{{background:#000;color:#f0f0f0;padding:10px 12px;border-radius:8px;overflow:auto;font-size:12px;max-height:340px;border:1px solid #333}}
+.badge{{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;background:#000;color:#fff;margin-right:6px;letter-spacing:.04em}}
+li.good .badge{{background:#000;color:#fff}}li.warn .badge{{background:#fff;color:#000;border:1px solid #000}}li.bad .badge{{background:#fff;color:#000;border:2px solid #000}}li.info .badge{{background:#555;color:#fff}}
+ul.recs{{list-style:none;padding:0;margin:0}}ul.recs li{{padding:8px 10px;border:1px solid #d4d4d4;border-radius:8px;margin:6px 0;background:#f4f4f4;color:#111}}
+.toolbar{{display:flex;gap:8px;margin-bottom:8px}}input[type=search]{{flex:1;padding:7px 10px;border:1px solid #111;border-radius:6px;background:#fff;color:#111}}
+footer{{color:#888;font-size:12px;text-align:center;margin:14px}}
 @media print{{header{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}.wrap{{margin:0;max-width:none}}}}
 </style></head><body>
 <header><h1>Wi-Fi Diagnostic Report</h1>
