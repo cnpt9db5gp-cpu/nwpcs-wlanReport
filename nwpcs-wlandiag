@@ -30,6 +30,7 @@ import functools
 import html
 import http.server
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -40,8 +41,20 @@ import threading
 import time
 import webbrowser
 
-VERSION = "1.9.1"
-DEFAULT_OUT = str(pathlib.Path.home() / "nwpcs-wlandiag.html")
+VERSION = "1.10.0"
+
+
+def data_dir():
+    """Organized home for all tool outputs (XDG_DATA_HOME aware).
+
+    Everything the tool writes — reports, JSON sidecars, chat transcripts —
+    lives here instead of being scattered across $HOME.
+    """
+    base = os.environ.get("XDG_DATA_HOME") or str(pathlib.Path.home() / ".local" / "share")
+    return pathlib.Path(base) / "nwpcs-wlandiag"
+
+
+DEFAULT_OUT = str(data_dir() / "nwpcs-wlandiag.html")
 
 # ------------------------------------------------- ASCII art + chat UX
 
@@ -1095,7 +1108,8 @@ def cmd_chat(iface, use_color=True, banner=True):
         else:
             chat.say("wlan", f"hmm, I don't know '{cmd}'. try: help")
     try:
-        tp = pathlib.Path.home() / "nwpcs-wlandiag-chat.log"
+        tp = data_dir() / "nwpcs-wlandiag-chat.log"
+        tp.parent.mkdir(parents=True, exist_ok=True)
         chat.save(str(tp))
         print(f"chat transcript: {tp}")
     except Exception:  # noqa: BLE001

@@ -59,11 +59,11 @@ nwpcs-wlandiag scan                          # terminal table (like netsh wlan s
 nwpcs-wlandiag scan --json --limit 10 --sort signal|channel|ssid
 nwpcs-wlandiag info                          # current connection summary
 nwpcs-wlandiag chat                          # interactive chatbox mode
-nwpcs-wlandiag report                        # -> ~/nwpcs-wlandiag.html + -data.json + -chat.log
+nwpcs-wlandiag report                        # -> data dir (see below) + -data.json + -chat.log
 nwpcs-wlandiag report -o /tmp/wifi.html --open
-nwpcs-wlandiag open                            # open ~/nwpcs-wlandiag.html in your browser
+nwpcs-wlandiag open                            # open the latest report in your browser
 nwpcs-wlandiag report --serve --port 8000    # generate + serve + open browser
-nwpcs-wlandiag serve ~/nwpcs-wlandiag.html --port 8000 --open
+nwpcs-wlandiag serve ~/.local/share/nwpcs-wlandiag/nwpcs-wlandiag.html --port 8000 --open
 nwpcs-wlandiag --iface wlo1 report -o out.html
 nwpcs-wlandiag --no-banner scan              # skip the ASCII banner
 ```
@@ -79,7 +79,22 @@ you> exit
 ```
 
 Commands: `check | scan | info | report [-o file] | open | serve [port] | log | clear | help | exit`.
-The transcript is saved to `~/nwpcs-wlandiag-chat.log`.
+The transcript is saved inside the data dir (see below).
+
+### Where files go
+
+Nothing is scattered across `$HOME`. Everything the tool writes lives in one
+organized directory (XDG-aware — honors `$XDG_DATA_HOME`):
+
+```
+~/.local/share/nwpcs-wlandiag/
+├── nwpcs-wlandiag.html       # latest report (open with `nwpcs-wlandiag open`)
+├── nwpcs-wlandiag-data.json  # raw scan data
+└── nwpcs-wlandiag-chat.log   # chat transcripts
+```
+
+Pass `-o` anywhere else if you want a report in a specific place — sidecars
+(`-data.json`, `-chat.log`) are written next to it.
 
 ### Sharing reports
 
