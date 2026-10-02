@@ -59,7 +59,6 @@ nwpcs-wlandiag scan                          # terminal table (like netsh wlan s
 nwpcs-wlandiag scan --json --limit 10 --sort signal|channel|ssid
 nwpcs-wlandiag info                          # current connection + best channels + security summary
 nwpcs-wlandiag speed                          # real download throughput in Mbps
-nwpcs-wlandiag history                        # signal/link snapshots over time
 nwpcs-wlandiag bw                              # bandwidth workload 24h/7d + normal curve
 nwpcs-wlandiag chat                          # interactive chatbox mode
 nwpcs-wlandiag report                        # -> data dir (see below) + -data.json + -chat.log
@@ -81,13 +80,10 @@ you> open
 you> exit
 ```
 
-Commands: `check | scan | info | advise | speed | history | bw | fix | report [-o file] | open | serve [port] | log | clear | help | exit`.
+Commands: `check | scan | info | advise | speed | bw | fix | report [-o file] | open | serve [port] | log | clear | help | exit`.
 The transcript is saved inside the data dir (see below).
 
 ### Bigger diagnostics
-- **History** — every `scan`/`info`/`report` appends to `history.db` in the
-  data dir (30-day retention, `--no-history` opts out). The report charts
-  per-SSID signal over 7 days plus recent link snapshots.
 - **Bandwidth workload** — interface byte counters sampled on every run give
   24h/7d up/down totals, peak hour, per-hour and per-day charts, plus a
   histogram with a fitted normal curve N(μ, σ²) so you can see at a glance
@@ -134,7 +130,7 @@ organized directory (XDG-aware — honors `$XDG_DATA_HOME`):
 ├── nwpcs-wlandiag.html       # latest report (open with `nwpcs-wlandiag open`)
 ├── nwpcs-wlandiag-data.json  # raw scan data
 ├── nwpcs-wlandiag-chat.log   # chat transcripts
-└── history.db                # signal/link history (sqlite)
+└── history.db                # bandwidth samples (sqlite)
 ```
 
 Pass `-o` anywhere else if you want a report in a specific place — sidecars

@@ -45,7 +45,7 @@ import time
 import urllib.request
 import webbrowser
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 
 
 def data_dir():
@@ -60,20 +60,13 @@ def data_dir():
 
 DEFAULT_OUT = str(data_dir() / "nwpcs-wlandiag.html")
 HISTORY_DB = str(data_dir() / "history.db")
-HISTORY_KEEP_DAYS = 30
 
 
-# ------------------------------------------------- scan history (sqlite)
+# ------------------------------------------------- sample store (sqlite)
 
 def _history_conn():
     data_dir().mkdir(parents=True, exist_ok=True)
     cx = sqlite3.connect(HISTORY_DB)
-    cx.execute("CREATE TABLE IF NOT EXISTS ap_scan(ts INTEGER, iface TEXT, ssid TEXT,"
-               " bssid TEXT, chan TEXT, freq_mhz INTEGER, signal INTEGER, security TEXT, band TEXT)")
-    cx.execute("CREATE TABLE IF NOT EXISTS link(ts INTEGER, iface TEXT, ssid TEXT, bssid TEXT,"
-               " dbm INTEGER, ping_gw REAL, ping_ext REAL)")
-    cx.execute("CREATE INDEX IF NOT EXISTS idx_ap_ts ON ap_scan(ts)")
-    cx.execute("CREATE INDEX IF NOT EXISTS idx_link_ts ON link(ts)")
     cx.execute("CREATE TABLE IF NOT EXISTS bw(ts INTEGER, iface TEXT, rx_bytes INTEGER,"
                " tx_bytes INTEGER)")
     cx.execute("CREATE INDEX IF NOT EXISTS idx_bw_ts ON bw(ts)")
@@ -256,127 +249,6 @@ def svg_gauss(vals, width=560, height=170, unit="B/s"):
                          f'<text x="{px + 2:.1f}" y="{pad_t + 10}" font-size="9" fill="#555">{lab}</text>')
     parts.append(f'<text x="{pad_l}" y="{height - 5}" font-size="10" fill="#5c5c5c">'
                  f'n={n} μ={mu:,.0f} σ={sigma:,.0f} {esc(unit)}</text></svg>')
-    return "".join(parts)
-
-
-def record_history(nets, iface, cur_ssid="", cur_bssid="", dbm=None, ping_gw=None, ping_ext=None):
-    """Append one scan snapshot. Never raises — history must not break diagnosis."""
-    try:
-        cx = _history_conn()
-        now = int(time.time())
-        for n in nets:
-            cx.execute("INSERT INTO ap_scan VALUES (?,?,?,?,?,?,?,?,?)",
-                       (now, iface, n.get("SSID", ""), n.get("BSSID", ""), n.get("CHAN", ""),
-                        n.get("FREQ_MHZ", 0), n.get("SIGNAL_INT", -1), n.get("SECURITY", ""),
-                        n.get("BAND", "")))
-        if cur_ssid:
-            try:
-                gw = float((ping_gw or {}).get("avg", 0)) or None
-            except (TypeError, ValueError):
-                gw = None
-            try:
-                ext = float((ping_ext or {}).get("avg", 0)) or None
-            except (TypeError, ValueError):
-                ext = None
-            cx.execute("INSERT INTO link VALUES (?,?,?,?,?,?,?)",
-                       (now, iface, cur_ssid, cur_bssid, dbm, gw, ext))
-        cutoff = now - HISTORY_KEEP_DAYS * 86400
-        cx.execute("DELETE FROM ap_scan WHERE ts < ?", (cutoff,))
-        cx.execute("DELETE FROM link WHERE ts < ?", (cutoff,))
-        cx.commit()
-        cx.close()
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def read_history(limit=50, days=7):
-    """Return {'link': [...], 'aps': {ssid: [(ts, signal)]}}. Newest-first link rows."""
-    out = {"link": [], "aps": {}}
-    try:
-        cx = _history_conn()
-        since = int(time.time()) - days * 86400
-        for row in cx.execute("SELECT ts, iface, ssid, bssid, dbm, ping_gw, ping_ext FROM link"
-                              " WHERE ts >= ? ORDER BY ts DESC LIMIT ?", (since, limit)):
-            out["link"].append({"ts": row[0], "iface": row[1], "ssid": row[2], "bssid": row[3],
-                                "dbm": row[4], "ping_gw": row[5], "ping_ext": row[6]})
-        for ssid, ts, sig in cx.execute("SELECT ssid, ts, signal FROM ap_scan WHERE ts >= ?"
-                                        " AND ssid != '' ORDER BY ts", (since,)):
-            out["aps"].setdefault(ssid if ssid else "(hidden)", []).append((ts, sig))
-        cx.close()
-    except Exception:  # noqa: BLE001
-        pass
-    return out
-
-
-def clear_history():
-    try:
-        cx = _history_conn()
-        cx.execute("DELETE FROM ap_scan")
-        cx.execute("DELETE FROM link")
-        cx.commit()
-        cx.close()
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def snapshot_link(data):
-    """Extract (ssid, bssid, dbm) of the current connection from collected data."""
-    nets = data.get("nets", [])
-    cur = next((n for n in nets if n.get("IN-USE") == "*"), None)
-    m = re.search(r"signal:\s*(-?\d+)\s*dBm", data.get("iw_link", ""))
-    if m:
-        dbm = int(m.group(1))
-    elif cur:
-        dbm = signal_to_dbm(cur["SIGNAL_INT"])
-    else:
-        dbm = None
-    ms = re.search(r"SSID:\s*(.+)", data.get("iw_link", ""))
-    mb = re.search(r"Connected to\s*([0-9a-f:]+)", data.get("iw_link", ""))
-    ssid = ms.group(1).strip() if ms else (cur["SSID"] if cur else "")
-    bssid = mb.group(1) if mb else (cur["BSSID"] if cur else "")
-    return ssid, bssid, dbm
-
-
-def svg_history(series, width=560, height=150, max_points=60):
-    """Inline SVG line chart (grayscale, no deps). series: {label: [(ts, val)]}."""
-    esc = html.escape
-    shades = ["#000000", "#444444", "#777777", "#aaaaaa", "#cccccc"]
-    pad_l, pad_b, pad_t = 34, 18, 8
-    iw, ih = width - pad_l - 8, height - pad_t - pad_b
-    if not series:
-        return '<p class="muted">No history yet — run a few scans and this chart fills in.</p>'
-    tmin = min(t for pts in series.values() for t, _ in pts[-max_points:])
-    tmax = max(t for pts in series.values() for t, _ in pts[-max_points:]) or (tmin + 1)
-    if tmax == tmin:
-        tmax = tmin + 1
-
-    def x(t):
-        return pad_l + (t - tmin) / (tmax - tmin) * iw
-
-    def y(v):
-        v = max(0, min(100, v))
-        return pad_t + (100 - v) / 100 * ih
-
-    parts = [f'<svg viewBox="0 0 {width} {height}" style="width:100%;height:auto" role="img">']
-    for gv in (0, 25, 50, 75, 100):
-        yy = y(gv)
-        parts.append(f'<line x1="{pad_l}" y1="{yy}" x2="{width - 8}" y2="{yy}" stroke="#d4d4d4" stroke-width="1"/>'
-                     f'<text x="2" y="{yy + 4}" font-size="10" fill="#5c5c5c">{gv}</text>')
-    for i, (label, pts) in enumerate(list(series.items())[:5]):
-        pts = pts[-max_points:]
-        d = "M" + " L".join(f"{x(t):.1f},{y(v):.1f}" for t, v in pts)
-        parts.append(f'<path d="{d}" fill="none" stroke="{shades[i % len(shades)]}" stroke-width="2"/>')
-    t0 = datetime.datetime.fromtimestamp(tmin).strftime("%H:%M")
-    t1 = datetime.datetime.fromtimestamp(tmax).strftime("%H:%M")
-    parts.append(f'<text x="{pad_l}" y="{height - 4}" font-size="10" fill="#5c5c5c">{esc(t0)}</text>'
-                 f'<text x="{width - 34}" y="{height - 4}" font-size="10" fill="#5c5c5c">{esc(t1)}</text>')
-    lx = pad_l
-    for i, label in enumerate(list(series.keys())[:5]):
-        parts.append(f'<circle cx="{lx}" cy="10" r="3" fill="{shades[i % len(shades)]}"/>'
-                     f'<text x="{lx + 6}" y="13" font-size="10" fill="#111">{esc(label[:22])}</text>')
-        lx += len(label[:22]) * 6 + 22
-    parts.append("</svg>")
     return "".join(parts)
 
 
@@ -1529,30 +1401,6 @@ def render_html(data, log_minutes=60):
         f"<strong>{esc(t)}</strong> — {esc(d)}</li>"
         for s, t, d in audit_security(nets, raw_bssid))
 
-    hist = read_history(limit=80, days=7)
-    ordered = {}
-    if cur and cur.get("SSID") in hist["aps"]:
-        ordered[cur["SSID"]] = hist["aps"][cur["SSID"]]
-    for ssid, pts in sorted(hist["aps"].items(),
-                            key=lambda kv: max(v for _, v in kv[1]), reverse=True):
-        if ssid not in ordered:
-            ordered[ssid] = pts
-        if len(ordered) >= 5:
-            break
-    hist_svg = svg_history(ordered)
-    if hist["link"]:
-        def _ms(v):
-            return f"{v} ms" if v is not None else "-"
-        link_rows_html = "".join(
-            f"<tr><td class='mono'>{esc(datetime.datetime.fromtimestamp(r['ts']).strftime('%m-%d %H:%M'))}</td>"
-            f"<td>{esc(r['ssid'] or '-')}</td>"
-            f"<td class='mono'>{r['dbm'] if r['dbm'] is not None else '-'} dBm</td>"
-            f"<td class='mono'>{_ms(r['ping_gw'])}</td><td class='mono'>{_ms(r['ping_ext'])}</td></tr>"
-            for r in hist["link"][:8])
-    else:
-        link_rows_html = ("<tr><td colspan='5' class='muted'>No link snapshots yet — "
-                           "they accumulate each time you scan, check info, or build a report.</td></tr>")
-
     sp = data.get("speed", {}) or {}
     if "mbps" in sp:
         speed_html = (f"<div class='grid'><div class='kpi'><div class='l'>Download throughput</div>"
@@ -1693,8 +1541,6 @@ footer{{color:#888;font-size:12px;text-align:center;margin:14px}}
 <div><h3>Bands</h3><table>{band_rows_html}</table></div>
 <div><h3>Security</h3><table>{sec_rows_html}</table></div></div>
 <p class="muted">WPA1/TKIP and WEP are deprecated. WPA2 (CCMP) is the baseline; WPA2/WPA3-transitional or WPA3-SAE preferred.</p></div>
-<div class="card"><h2>Signal history (7 days)</h2>{hist_svg}
-<h3>Recent link snapshots</h3><table><tr><th>Time</th><th>SSID</th><th>Signal</th><th>GW ping</th><th>Inet ping</th></tr>{link_rows_html}</table></div>
 <div class="card"><h2>Bandwidth workload — 24h / 7 days</h2>{bw_kpis}
 <h3>Traffic per hour (last 24h, bytes)</h3>{bw_bars_24}
 <h3>Traffic per day (last 7 days, bytes)</h3>{bw_bars_7d}
@@ -1874,7 +1720,7 @@ def build_parser():
     s.add_argument("--json", action="store_true", help="output JSON instead of table")
     s.add_argument("--limit", type=int, default=0, help="show only top N networks")
     s.add_argument("--sort", choices=["signal", "channel", "ssid"], default="signal")
-    s.add_argument("--no-history", action="store_true", help="don't record this scan in history")
+    s.add_argument("--no-history", action="store_true", help="don't record bandwidth sample")
 
     i = sub.add_parser("info", help="show current connection summary in the terminal")
     i.add_argument("--iface", default=argparse.SUPPRESS)
@@ -1882,7 +1728,7 @@ def build_parser():
     i.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
     i.add_argument("--no-rescan", action="store_true")
     i.add_argument("--no-ping", action="store_true", help="skip ping tests (faster/offline)")
-    i.add_argument("--no-history", action="store_true", help="don't record this snapshot in history")
+    i.add_argument("--no-history", action="store_true", help="don't record bandwidth sample")
     i.add_argument("--json", action="store_true")
 
     c = sub.add_parser("chat", help="interactive chatbox mode: talk to the diagnostic assistant")
@@ -1909,7 +1755,7 @@ def build_parser():
     r.add_argument("--no-rescan", action="store_true")
     r.add_argument("--no-ping", action="store_true")
     r.add_argument("--no-speed", action="store_true", help="skip download throughput test (faster)")
-    r.add_argument("--no-history", action="store_true", help="don't record this run in history")
+    r.add_argument("--no-history", action="store_true", help="don't record bandwidth sample")
     r.add_argument("--log-minutes", type=int, default=60, help="how much journal history to embed (default: 60)")
     r.add_argument("--open", action="store_true", help="open the report in a browser after generating")
     r.add_argument("--serve", action="store_true", help="serve the report over HTTP after generating")
@@ -1938,14 +1784,6 @@ def build_parser():
     f.add_argument("--yes", action="store_true", help="apply without asking (dangerous steps still listed)")
     f.add_argument("--undo-dns", action="store_true", help="revert a previous DNS switch")
 
-    h = sub.add_parser("history", help="show recorded signal/link history")
-    h.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
-    h.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
-    h.add_argument("--limit", type=int, default=10, help="link snapshots to show (default: 10)")
-    h.add_argument("--days", type=int, default=7, help="look back this many days (default: 7)")
-    h.add_argument("--clear", action="store_true", help="wipe all recorded history")
-    h.add_argument("--json", action="store_true", help="output machine-readable JSON")
-
     sp = sub.add_parser("speed", help="measure real download throughput in Mbps")
     sp.add_argument("--bytes", type=int, default=25_000_000, help="bytes to download (default: 25000000)")
     sp.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
@@ -1967,8 +1805,6 @@ def build_report_file(out, iface, chat):
     """Run the full diagnostic and write the HTML report. Returns (path, count)."""
     chat.say("wlan", f"building the full HTML report → {out} …")
     data = collect_all(iface, rescan=True, do_ping=True, log=chat, do_speed=True)
-    ssid, bssid, dbm = snapshot_link(data)
-    record_history(data["nets"], iface, ssid, bssid, dbm, data["ping_gw"], data["ping_ext"])
     record_bw(iface)
     html_doc = render_html(data)
     op = pathlib.Path(out)
@@ -1983,7 +1819,7 @@ def cmd_chat(iface, use_color=True, banner=True):
     if banner:
         show_banner(use_color=use_color)
     chat.box("nwpcs-wlandiag chat",
-             "commands: check | scan | info | advise | speed | history | bw | fix | report [-o file] | open | serve [port] | log | clear | help | exit")
+             "commands: check | scan | info | advise | speed | bw | fix | report [-o file] | open | serve [port] | log | clear | help | exit")
     chat.say("wlan", f"hey! watching {iface} for you. what should we diagnose?")
     last_report = DEFAULT_OUT
     HELP = ("check ......... verify tools + permissions (check-deps)\n"
@@ -1991,7 +1827,6 @@ def cmd_chat(iface, use_color=True, banner=True):
             "info .......... current connection summary\n"
             "advise ........ best Wi-Fi channels for your router\n"
             "speed ......... measure real download throughput\n"
-            "history ....... show recorded signal/link history\n"
             "bw ............ bandwidth workload 24h/7d + normal curve\n"
             "fix ........... diagnose + repair (fix --dry-run to preview)\n"
             "report ........ generate HTML report (report -o /tmp/x.html)\n"
@@ -2061,16 +1896,6 @@ def cmd_chat(iface, use_color=True, banner=True):
                                  f"({res['bytes'] // 1_000_000} MB in {res['seconds']}s)")
             else:
                 chat.say("wlan", f"speed test failed: {res['error']}")
-        elif cmd == "history":
-            h = read_history(limit=10, days=7)
-            if not h["link"] and not h["aps"]:
-                chat.say("wlan", "no history yet — run scan/info/report a few times first.")
-            else:
-                for r in h["link"][:5]:
-                    ts = datetime.datetime.fromtimestamp(r["ts"]).strftime("%m-%d %H:%M")
-                    chat.say("wlan", f"{ts} · {r['ssid'] or '-'} · "
-                                     f"{r['dbm']} dBm · gw {r['ping_gw']} ms · inet {r['ping_ext']} ms")
-                chat.say("wlan", "full charts live in your next HTML report.")
         elif cmd == "bw":
             s = bw_summary(iface, days=7)
             if not s["n"]:
@@ -2161,7 +1986,7 @@ def main(argv=None):
     # legacy: `nwpcs-wlandiag out.html` (no subcommand) == `nwpcs-wlandiag report -o out.html`
     if argv is None:
         argv = sys.argv[1:]
-    if argv and argv[0] not in ("scan", "info", "chat", "check-deps", "doctor", "report", "serve", "open", "history", "speed", "fix", "bw", "-h", "--help", "-V", "--version") and not argv[0].startswith("-"):
+    if argv and argv[0] not in ("scan", "info", "chat", "check-deps", "doctor", "report", "serve", "open", "speed", "fix", "bw", "-h", "--help", "-V", "--version") and not argv[0].startswith("-"):
         argv = ["report", "-o"] + argv
     args = build_parser().parse_args(argv)
     cmd = args.cmd or "chat"  # bare `nwpcs-wlandiag` drops into interactive mode
@@ -2193,7 +2018,6 @@ def main(argv=None):
         chat.say("you", f"scan on {iface}")
         nets = get_wifi_networks(iface, rescan=not args.no_rescan, log=None if json_mode else chat)
         if not getattr(args, "no_history", False):
-            record_history(nets, iface)
             record_bw(iface)
         if args.json:
             print(json.dumps(nets, indent=2))
@@ -2207,9 +2031,6 @@ def main(argv=None):
         data = collect_all(iface, rescan=not args.no_rescan, do_ping=not args.no_ping,
                            log=None if json_mode else chat)
         if not getattr(args, "no_history", False):
-            ssid, bssid, dbm = snapshot_link(data)
-            record_history(data["nets"], iface, ssid, bssid, dbm,
-                           data["ping_gw"], data["ping_ext"])
             record_bw(iface)
         if args.json:
             slim = {"iface": iface, "device": data["dev_kv"], "networks": data["nets"],
@@ -2218,35 +2039,6 @@ def main(argv=None):
         else:
             print()
             print_info(data)
-        return
-
-    if cmd == "history":
-        if getattr(args, "clear", False):
-            ok = clear_history()
-            print("history cleared." if ok else "error: could not clear history")
-            sys.exit(0 if ok else 1)
-        h = read_history(limit=args.limit, days=args.days)
-        if getattr(args, "json", False):
-            print(json.dumps(h, indent=2))
-            return
-        if not h["link"] and not h["aps"]:
-            print(f"No history yet — run scan/info/report to start recording (stored in {HISTORY_DB})")
-            return
-        print(f"Link snapshots (last {len(h['link'])}):")
-        print(f'{"TIME":16} {"SSID":24} {"SIG":>8}  {"GW":>9}  {"INET":>9}')
-        print("-" * 72)
-        for r in h["link"]:
-            ts = datetime.datetime.fromtimestamp(r["ts"]).strftime("%m-%d %H:%M")
-            gw = f"{r['ping_gw']} ms" if r["ping_gw"] is not None else "-"
-            ext = f"{r['ping_ext']} ms" if r["ping_ext"] is not None else "-"
-            dbm = f"{r['dbm']} dBm" if r["dbm"] is not None else "-"
-            print(f"{ts:16} {(r['ssid'] or '-')[:24]:24} {dbm:>8}  {gw:>9}  {ext:>9}")
-        if h["aps"]:
-            print("\nStrongest networks (7-day max signal):")
-            best = sorted(((max(v for _, v in pts), ssid) for ssid, pts in h["aps"].items()),
-                          reverse=True)[:8]
-            for sig, ssid in best:
-                print(f"  {sig:>3}%  {ssid}")
         return
 
     if cmd == "speed":
@@ -2367,8 +2159,6 @@ def main(argv=None):
     data = collect_all(iface, rescan=rescan, do_ping=do_ping, log_minutes=log_minutes, log=chat,
                        do_speed=do_speed)
     if not getattr(args, "no_history", False):
-        ssid, bssid, dbm = snapshot_link(data)
-        record_history(data["nets"], iface, ssid, bssid, dbm, data["ping_gw"], data["ping_ext"])
         record_bw(iface)
     chat.step("render", "rendering HTML report")
     html_doc = render_html(data, log_minutes=log_minutes)
