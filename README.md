@@ -60,6 +60,7 @@ nwpcs-wlandiag scan --json --limit 10 --sort signal|channel|ssid
 nwpcs-wlandiag info                          # current connection + best channels + security summary
 nwpcs-wlandiag speed                          # real download throughput in Mbps
 nwpcs-wlandiag history                        # signal/link snapshots over time
+nwpcs-wlandiag bw                              # bandwidth workload 24h/7d + normal curve
 nwpcs-wlandiag chat                          # interactive chatbox mode
 nwpcs-wlandiag report                        # -> data dir (see below) + -data.json + -chat.log
 nwpcs-wlandiag report -o /tmp/wifi.html --open
@@ -80,13 +81,23 @@ you> open
 you> exit
 ```
 
-Commands: `check | scan | info | advise | speed | history | report [-o file] | open | serve [port] | log | clear | help | exit`.
+Commands: `check | scan | info | advise | speed | history | bw | fix | report [-o file] | open | serve [port] | log | clear | help | exit`.
 The transcript is saved inside the data dir (see below).
 
 ### Bigger diagnostics
 - **History** — every `scan`/`info`/`report` appends to `history.db` in the
   data dir (30-day retention, `--no-history` opts out). The report charts
   per-SSID signal over 7 days plus recent link snapshots.
+- **Bandwidth workload** — interface byte counters sampled on every run give
+  24h/7d up/down totals, peak hour, per-hour and per-day charts, plus a
+  histogram with a fitted normal curve N(μ, σ²) so you can see at a glance
+  whether usage is steady or burst-heavy. For dense history, sample every
+  minute via cron (samples are one cheap file read each):
+  ```bash
+  * * * * * nwpcs-wlandiag bw sample >/dev/null 2>&1
+  ```
+  `nwpcs-wlandiag bw` shows the totals; `bw sample` records one sample
+  (made for cron); `bw --json` is script-friendly.
 - **Channel advisor** — scores channels by neighbor congestion (with 2.4 GHz
   overlap math) and names the best pick per band, in `info`, chat (`advise`),
   and the report.

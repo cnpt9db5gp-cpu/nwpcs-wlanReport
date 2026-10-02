@@ -30,6 +30,7 @@ import functools
 import html
 import http.server
 import json
+import math
 import os
 import pathlib
 import re
@@ -44,7 +45,7 @@ import time
 import urllib.request
 import webbrowser
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 
 
 def data_dir():
@@ -73,7 +74,189 @@ def _history_conn():
                " dbm INTEGER, ping_gw REAL, ping_ext REAL)")
     cx.execute("CREATE INDEX IF NOT EXISTS idx_ap_ts ON ap_scan(ts)")
     cx.execute("CREATE INDEX IF NOT EXISTS idx_link_ts ON link(ts)")
+    cx.execute("CREATE TABLE IF NOT EXISTS bw(ts INTEGER, iface TEXT, rx_bytes INTEGER,"
+               " tx_bytes INTEGER)")
+    cx.execute("CREATE INDEX IF NOT EXISTS idx_bw_ts ON bw(ts)")
     return cx
+
+
+# ------------------------------------------------- bandwidth workload
+
+def read_counters(iface):
+    """Kernel byte counters for an interface. Returns (rx, tx) or None."""
+    try:
+        base = pathlib.Path("/sys/class/net") / iface / "statistics"
+        rx = int((base / "rx_bytes").read_text().strip())
+        tx = int((base / "tx_bytes").read_text().strip())
+        return rx, tx
+    except Exception:  # noqa: BLE001 no such iface / no permission
+        return None
+
+
+def record_bw(iface):
+    """Append one counter sample. Never raises."""
+    try:
+        c = read_counters(iface)
+        if c is None:
+            return False
+        cx = _history_conn()
+        cx.execute("INSERT INTO bw VALUES (?,?,?,?)", (int(time.time()), iface, c[0], c[1]))
+        cutoff = int(time.time()) - 30 * 86400
+        cx.execute("DELETE FROM bw WHERE ts < ?", (cutoff,))
+        cx.commit()
+        cx.close()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def bw_rates(iface, days=7):
+    """Per-interval byte rates from consecutive samples: [(ts, down_Bps, up_Bps)]."""
+    try:
+        cx = _history_conn()
+        since = int(time.time()) - days * 86400
+        rows = cx.execute("SELECT ts, rx_bytes, tx_bytes FROM bw WHERE iface=? AND ts>=? "
+                          "ORDER BY ts", (iface, since)).fetchall()
+        cx.close()
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for (t1, rx1, tx1), (t2, rx2, tx2) in zip(rows, rows[1:]):
+        dt = t2 - t1
+        dr, du = rx2 - rx1, tx2 - tx1
+        if dt <= 0 or dr < 0 or du < 0:  # counter reset / reboot
+            continue
+        out.append((t2, dr / dt, du / dt))
+    return out
+
+
+def fmt_bytes(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def bw_summary(iface, days=7):
+    """Totals, peaks and hourly/daily buckets. All rates are bytes/sec."""
+    rates = bw_rates(iface, days)
+    s = {"n": len(rates), "iface": iface, "days": days, "total_down": 0.0, "total_up": 0.0,
+         "avg_down": 0.0, "avg_up": 0.0, "peak_down": 0.0, "peak_up": 0.0,
+         "peak_ts": None, "hourly": [], "daily": []}
+    if not rates:
+        return s
+    tot_d = tot_u = 0.0
+    hours, daysum = {}, {}
+    peak, peak_ts = 0.0, None
+    gaps = [rates[i + 1][0] - r[0] for i, r in enumerate(rates[:-1])]
+    last_dt = sorted(gaps)[len(gaps) // 2] if gaps else 0
+    for i, (t, d, u) in enumerate(rates):
+        dt = (rates[i + 1][0] - t) if i + 1 < len(rates) else last_dt
+        tot_d += d * dt
+        tot_u += u * dt
+        h = datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:00")
+        hours[h] = hours.get(h, [0.0, 0])
+        hours[h][0] += d * dt
+        hours[h][1] += 1
+        dy = datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d")
+        daysum[dy] = daysum.get(dy, 0.0) + (d + u) * dt
+        if d + u > peak:
+            peak, peak_ts = d + u, t
+    span = max(r[0] for r in rates) - min(r[0] for r in rates)
+    s.update(total_down=tot_d, total_up=tot_u,
+             avg_down=tot_d / span if span else 0, avg_up=tot_u / span if span else 0,
+             peak_down=peak, peak_ts=peak_ts,
+             hourly=sorted((h, v[0]) for h, v in hours.items()),
+             daily=sorted(daysum.items()))
+    return s
+
+
+def gauss_fit(vals):
+    """Mean/stddev of samples. Returns (mu, sigma, n) or (0,0,0)."""
+    vals = [float(v) for v in vals if v is not None]
+    if len(vals) < 5:
+        return 0.0, 0.0, len(vals)
+    mu = statistics.fmean(vals)
+    sigma = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+    return mu, sigma, len(vals)
+
+
+def svg_bars(pairs, width=560, height=130, unit=""):
+    """Vertical bar chart. pairs: [(label, value)]. Grayscale."""
+    esc = html.escape
+    if not pairs:
+        return '<p class="muted">No samples in this window yet.</p>'
+    mx = max(v for _, v in pairs) or 1
+    n = len(pairs)
+    bw = min(34, (width - 40) / max(n, 1) - 4)
+    parts = [f'<svg viewBox="0 0 {width} {height}" style="width:100%;height:auto" role="img">']
+    for i, (label, v) in enumerate(pairs):
+        h = max(2, (v / mx) * (height - 34))
+        x = 34 + i * ((width - 40) / n)
+        y = height - 20 - h
+        parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw:.1f}" height="{h:.1f}" fill="#000"/>'
+                     f'<title>{esc(label)}: {esc(unit)}{v:,.0f}</title>')
+    every = max(1, n // 8)
+    for i, (label, _) in enumerate(pairs):
+        if i % every == 0:
+            x = 34 + i * ((width - 40) / n)
+            parts.append(f'<text x="{x:.1f}" y="{height - 6}" font-size="9" fill="#5c5c5c">'
+                         f'{esc(label[-5:])}</text>')
+    parts.append(f'<text x="2" y="12" font-size="10" fill="#5c5c5c">{esc(unit)}{mx:,.0f}</text></svg>')
+    return "".join(parts)
+
+
+def svg_gauss(vals, width=560, height=170, unit="B/s"):
+    """Histogram + fitted normal curve (grayscale)."""
+    esc = html.escape
+    vals = [float(v) for v in vals if v is not None]
+    if len(vals) < 5:
+        return '<p class="muted">Not enough samples yet for a distribution (need 5+).</p>'
+    mu, sigma, n = gauss_fit(vals)
+    if sigma <= 0:
+        return (f'<p class="muted">All {n} samples identical '
+                f'({esc(unit)} {mu:,.0f}) — perfectly flat workload.</p>')
+    lo, hi = min(vals), max(vals)
+    span = (hi - lo) or 1.0
+    lo -= span * 0.05
+    hi += span * 0.05
+    nbins = min(12, max(5, n // 4))
+    bins = [0] * nbins
+    for v in vals:
+        b = min(nbins - 1, int((v - lo) / (hi - lo) * nbins))
+        bins[b] += 1
+    pad_l, pad_b, pad_t = 44, 20, 10
+    iw, ih = width - pad_l - 10, height - pad_t - pad_b
+    bmax = max(bins)
+    parts = [f'<svg viewBox="0 0 {width} {height}" style="width:100%;height:auto" role="img">']
+    bw = iw / nbins
+    for i, c in enumerate(bins):
+        h = (c / bmax) * ih * 0.92
+        x = pad_l + i * bw + 1
+        parts.append(f'<rect x="{x:.1f}" y="{pad_t + ih - h:.1f}" width="{bw - 2:.1f}" '
+                     f'height="{h:.1f}" fill="#d4d4d4"/>')
+    peak = 1 / (sigma * math.sqrt(2 * math.pi))
+    pts = []
+    for j in range(61):
+        x = lo + (hi - lo) * j / 60
+        dens = math.exp(-((x - mu) ** 2) / (2 * sigma ** 2)) / (sigma * math.sqrt(2 * math.pi))
+        px = pad_l + (x - lo) / (hi - lo) * iw
+        py = pad_t + ih - (dens / peak) * ih * 0.92
+        pts.append(f"{px:.1f},{py:.1f}")
+    parts.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="#000" stroke-width="2"/>')
+    for k, lab in ((-1, "μ−σ"), (0, "μ"), (1, "μ+σ")):
+        xv = mu + k * sigma
+        if lo <= xv <= hi:
+            px = pad_l + (xv - lo) / (hi - lo) * iw
+            dash = ' stroke-dasharray="3,3"' if k else ""
+            parts.append(f'<line x1="{px:.1f}" y1="{pad_t}" x2="{px:.1f}" y2="{pad_t + ih}" '
+                         f'stroke="#555" stroke-width="1"{dash}/>'
+                         f'<text x="{px + 2:.1f}" y="{pad_t + 10}" font-size="9" fill="#555">{lab}</text>')
+    parts.append(f'<text x="{pad_l}" y="{height - 5}" font-size="10" fill="#5c5c5c">'
+                 f'n={n} μ={mu:,.0f} σ={sigma:,.0f} {esc(unit)}</text></svg>')
+    return "".join(parts)
 
 
 def record_history(nets, iface, cur_ssid="", cur_bssid="", dbm=None, ping_gw=None, ping_ext=None):
@@ -1380,6 +1563,26 @@ def render_html(data, log_minutes=60):
     else:
         speed_html = "<p class='muted'>Throughput test skipped (--no-speed).</p>"
 
+    bw = bw_summary(iface, days=7)
+    bw_day = bw_summary(iface, days=1)
+    bw_rates_7d = [d + u for _, d, u in bw_rates(iface, days=7)]
+    mu, sigma, ng = gauss_fit(bw_rates_7d)
+    bw_kpis = (
+        f"<div class='grid'>"
+        f"<div class='kpi'><div class='l'>24h down / up</div><div class='v mono' style='font-size:15px'>"
+        f"{esc(fmt_bytes(bw_day['total_down']))} / {esc(fmt_bytes(bw_day['total_up']))}</div>"
+        f"<div class='muted'>{bw_day['n']} intervals sampled</div></div>"
+        f"<div class='kpi'><div class='l'>7d down / up</div><div class='v mono' style='font-size:15px'>"
+        f"{esc(fmt_bytes(bw['total_down']))} / {esc(fmt_bytes(bw['total_up']))}</div>"
+        f"<div class='muted'>avg {esc(fmt_bytes(bw['avg_down']))}/s down</div></div>"
+        f"<div class='kpi'><div class='l'>Normal fit (hourly rate)</div><div class='v mono' "
+        f"style='font-size:15px'>μ {esc(fmt_bytes(mu))}/s · σ {esc(fmt_bytes(sigma))}/s</div>"
+        f"<div class='muted'>n={ng} hourly samples</div></div>"
+        f"</div>")
+    bw_bars_24 = svg_bars([(h[5:], v) for h, v in bw_day["hourly"]], unit="B")
+    bw_bars_7d = svg_bars([(d[5:], v) for d, v in bw["daily"]], unit="B")
+    bw_gauss = svg_gauss(bw_rates_7d, unit="B/s")
+
     def _failed(p):
         return p.get("loss") not in ("0%", "?")
     conn_name = dev_kv.get("GENERAL.CONNECTION", "") or "<profile>"
@@ -1492,6 +1695,11 @@ footer{{color:#888;font-size:12px;text-align:center;margin:14px}}
 <p class="muted">WPA1/TKIP and WEP are deprecated. WPA2 (CCMP) is the baseline; WPA2/WPA3-transitional or WPA3-SAE preferred.</p></div>
 <div class="card"><h2>Signal history (7 days)</h2>{hist_svg}
 <h3>Recent link snapshots</h3><table><tr><th>Time</th><th>SSID</th><th>Signal</th><th>GW ping</th><th>Inet ping</th></tr>{link_rows_html}</table></div>
+<div class="card"><h2>Bandwidth workload — 24h / 7 days</h2>{bw_kpis}
+<h3>Traffic per hour (last 24h, bytes)</h3>{bw_bars_24}
+<h3>Traffic per day (last 7 days, bytes)</h3>{bw_bars_7d}
+<h3>Workload distribution vs normal (hourly combined rate)</h3>{bw_gauss}
+<p class="muted">Gray bars: observed hourly rates. Black curve: fitted normal N(μ, σ²). Bars hugging the curve ≈ steady workload; heavy right tail = burst-heavy usage. Counters sample on every scan/info/report — add <code>nwpcs-wlandiag bw sample</code> to cron for denser history.</p></div>
 <div class="card"><h2>Channel advisor</h2>{advisor_html}<p class="muted">Scores weigh nearby APs by signal strength — 2.4 GHz accounts for channel overlap, 5 GHz for co-channel sharing. Apply the pick on your router, then re-scan.</p></div>
 <div class="card"><h2>Security audit</h2><ul class="recs">{audit_html}</ul></div>
 <div class="card"><h2>Repair kit (works offline)</h2>
@@ -1525,6 +1733,23 @@ q.addEventListener('input',function(){{var s=q.value.toLowerCase();document.quer
 
 
 # ------------------------------------------------------------ terminal UI
+
+def print_bw(s):
+    print(f"Bandwidth workload — {s['iface']} (last {s['days']}d, {s['n']} intervals)")
+    if not s["n"]:
+        print("No samples yet. Run any scan/info/report, `bw sample`, or add a cron job:")
+        print("  * * * * * nwpcs-wlandiag bw sample >/dev/null 2>&1")
+        return
+    print(f"Down {fmt_bytes(s['total_down'])}   Up {fmt_bytes(s['total_up'])}   "
+          f"Avg {fmt_bytes(s['avg_down'])}/s down / {fmt_bytes(s['avg_up'])}/s up")
+    if s["peak_ts"]:
+        ts = datetime.datetime.fromtimestamp(s["peak_ts"]).strftime("%m-%d %H:%M")
+        print(f"Peak {fmt_bytes(s['peak_down'])}/s combined at {ts}")
+    if s["daily"]:
+        print("Per day (up+down):")
+        for day, total in s["daily"][-7:]:
+            print(f"  {day}  {fmt_bytes(total)}")
+
 
 def print_scan_table(nets, limit=0, sort="signal"):
     if sort == "channel":
@@ -1574,6 +1799,10 @@ def print_info(data):
         print(f"Security  : {len(worst)} warning(s) — worst: {worst[0][1]}")
     else:
         print("Security  : no warnings in this scan")
+    bw1 = bw_summary(data["iface"], days=1)
+    if bw1["n"]:
+        print(f"Bandwidth : 24h {fmt_bytes(bw1['total_down'])} down / "
+              f"{fmt_bytes(bw1['total_up'])} up ({bw1['n']} samples)")
 
 
 def open_in_browser(path_or_url):
@@ -1722,6 +1951,15 @@ def build_parser():
     sp.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
     sp.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
     sp.add_argument("--json", action="store_true", help="output machine-readable JSON")
+
+    bw = sub.add_parser("bw", help="bandwidth workload: sample counters, 24h/7d totals, normal curve")
+    bw.add_argument("action", nargs="?", default="report", choices=("report", "sample"),
+                    help="report (default) or record one sample now (for cron: * * * * *)")
+    bw.add_argument("--days", type=int, default=7, help="look back this many days (default: 7)")
+    bw.add_argument("--iface", default=argparse.SUPPRESS)
+    bw.add_argument("--no-banner", action="store_true", default=argparse.SUPPRESS)
+    bw.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS)
+    bw.add_argument("--json", action="store_true", help="output machine-readable JSON")
     return p
 
 
@@ -1731,6 +1969,7 @@ def build_report_file(out, iface, chat):
     data = collect_all(iface, rescan=True, do_ping=True, log=chat, do_speed=True)
     ssid, bssid, dbm = snapshot_link(data)
     record_history(data["nets"], iface, ssid, bssid, dbm, data["ping_gw"], data["ping_ext"])
+    record_bw(iface)
     html_doc = render_html(data)
     op = pathlib.Path(out)
     op.parent.mkdir(parents=True, exist_ok=True)
@@ -1744,7 +1983,7 @@ def cmd_chat(iface, use_color=True, banner=True):
     if banner:
         show_banner(use_color=use_color)
     chat.box("nwpcs-wlandiag chat",
-             "commands: check | scan | info | advise | speed | history | fix | report [-o file] | open | serve [port] | log | clear | help | exit")
+             "commands: check | scan | info | advise | speed | history | bw | fix | report [-o file] | open | serve [port] | log | clear | help | exit")
     chat.say("wlan", f"hey! watching {iface} for you. what should we diagnose?")
     last_report = DEFAULT_OUT
     HELP = ("check ......... verify tools + permissions (check-deps)\n"
@@ -1753,6 +1992,7 @@ def cmd_chat(iface, use_color=True, banner=True):
             "advise ........ best Wi-Fi channels for your router\n"
             "speed ......... measure real download throughput\n"
             "history ....... show recorded signal/link history\n"
+            "bw ............ bandwidth workload 24h/7d + normal curve\n"
             "fix ........... diagnose + repair (fix --dry-run to preview)\n"
             "report ........ generate HTML report (report -o /tmp/x.html)\n"
             "open .......... open report in browser (builds one if missing)\n"
@@ -1831,6 +2071,20 @@ def cmd_chat(iface, use_color=True, banner=True):
                     chat.say("wlan", f"{ts} · {r['ssid'] or '-'} · "
                                      f"{r['dbm']} dBm · gw {r['ping_gw']} ms · inet {r['ping_ext']} ms")
                 chat.say("wlan", "full charts live in your next HTML report.")
+        elif cmd == "bw":
+            s = bw_summary(iface, days=7)
+            if not s["n"]:
+                chat.say("wlan", "no bandwidth samples yet — they record on every scan/info/report.")
+            else:
+                chat.say("wlan", f"7d: {fmt_bytes(s['total_down'])} down / "
+                                 f"{fmt_bytes(s['total_up'])} up, "
+                                 f"avg {fmt_bytes(s['avg_down'])}/s down.")
+                mu, sigma, ng = gauss_fit([d + u for _, d, u in bw_rates(iface, days=7)])
+                if ng >= 5 and sigma > 0:
+                    chat.say("wlan", f"workload ≈ normal N(μ {fmt_bytes(mu)}/s, σ {fmt_bytes(sigma)}/s), "
+                                     f"n={ng}. charts live in your next HTML report.")
+                else:
+                    chat.say("wlan", "need a few more samples for the normal curve — keep using the tool.")
         elif cmd == "fix":
             if "--list" in rest:
                 for st in FIX_STEPS:
@@ -1907,7 +2161,7 @@ def main(argv=None):
     # legacy: `nwpcs-wlandiag out.html` (no subcommand) == `nwpcs-wlandiag report -o out.html`
     if argv is None:
         argv = sys.argv[1:]
-    if argv and argv[0] not in ("scan", "info", "chat", "check-deps", "doctor", "report", "serve", "open", "history", "speed", "fix", "-h", "--help", "-V", "--version") and not argv[0].startswith("-"):
+    if argv and argv[0] not in ("scan", "info", "chat", "check-deps", "doctor", "report", "serve", "open", "history", "speed", "fix", "bw", "-h", "--help", "-V", "--version") and not argv[0].startswith("-"):
         argv = ["report", "-o"] + argv
     args = build_parser().parse_args(argv)
     cmd = args.cmd or "chat"  # bare `nwpcs-wlandiag` drops into interactive mode
@@ -1940,6 +2194,7 @@ def main(argv=None):
         nets = get_wifi_networks(iface, rescan=not args.no_rescan, log=None if json_mode else chat)
         if not getattr(args, "no_history", False):
             record_history(nets, iface)
+            record_bw(iface)
         if args.json:
             print(json.dumps(nets, indent=2))
         else:
@@ -1955,6 +2210,7 @@ def main(argv=None):
             ssid, bssid, dbm = snapshot_link(data)
             record_history(data["nets"], iface, ssid, bssid, dbm,
                            data["ping_gw"], data["ping_ext"])
+            record_bw(iface)
         if args.json:
             slim = {"iface": iface, "device": data["dev_kv"], "networks": data["nets"],
                     "ping_gw": data["ping_gw"], "ping_ext": data["ping_ext"], "ping_dns": data["ping_dns"]}
@@ -2005,6 +2261,18 @@ def main(argv=None):
         else:
             print(f"Speed test failed: {res['error']}")
             sys.exit(1)
+        return
+
+    if cmd == "bw":
+        if args.action == "sample":
+            ok = record_bw(iface)
+            print(f"sampled {iface}: {'recorded' if ok else 'failed (no counters?)'}")
+            sys.exit(0 if ok else 1)
+        s = bw_summary(iface, days=args.days)
+        if getattr(args, "json", False):
+            print(json.dumps(s, indent=2, default=str))
+            return
+        print_bw(s)
         return
 
     if cmd == "fix":
@@ -2101,6 +2369,7 @@ def main(argv=None):
     if not getattr(args, "no_history", False):
         ssid, bssid, dbm = snapshot_link(data)
         record_history(data["nets"], iface, ssid, bssid, dbm, data["ping_gw"], data["ping_ext"])
+        record_bw(iface)
     chat.step("render", "rendering HTML report")
     html_doc = render_html(data, log_minutes=log_minutes)
     chat.done("render", "HTML rendered")
